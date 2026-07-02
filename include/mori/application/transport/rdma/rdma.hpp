@@ -1,0 +1,339 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+#pragma once
+
+// RdmaDeviceVendorId and RdmaMemoryRegion are defined in application_device_types.hpp
+// so that device (HIP/CUDA) compilation units can use them without ibverbs/STL dependencies.
+#include <unistd.h>
+
+#include <cassert>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "infiniband/verbs.h"
+#include "mori/application/application_device_types.hpp"
+#include "mori/core/transport/rdma/rdma.hpp"
+#include "mori/hip_compat.hpp"
+
+namespace mori {
+namespace application {
+
+#define MR_DEFAULT_ACCESS_FLAG                                                \
+  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
+      IBV_ACCESS_REMOTE_ATOMIC
+
+enum class RdmaBackendType : uint32_t {
+  Unknown = 0,
+  DirectVerbs = 1,
+  IBVerbs = 2,
+};
+
+// RdmaDeviceVendorId is defined in application_device_types.hpp (included above).
+// template helper for vendor ID conversion stays here (host-only use):
+
+template <typename T>
+RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
+  switch (v) {
+    case static_cast<T>(RdmaDeviceVendorId::Mellanox):
+      return RdmaDeviceVendorId::Mellanox;
+    default:
+      return RdmaDeviceVendorId::Unknown;
+  }
+  return RdmaDeviceVendorId::Unknown;
+}
+
+#define PAGESIZE uint32_t(sysconf(_SC_PAGE_SIZE))
+// #define OUTSTANDING_TABLE_SIZE (65536)
+
+// UDP sport configuration constants for multi-provider support
+static constexpr uint32_t RDMA_UDP_SPORT_ARRAY_SIZE = 4;
+
+// Atomic internal buffer configuration
+static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 8 bytes
+
+/* -------------------------------------------------------------------------- */
+/*                             Rdma Data Structure                            */
+/* -------------------------------------------------------------------------- */
+struct RdmaEndpointConfig {
+  uint32_t portId{1};
+  int32_t gidIdx{-1};  // -1 means auto detect
+  uint32_t maxMsgsNum{128};
+  uint32_t maxRecvWr{0};  // 0 = use maxMsgsNum for RQ depth (allows SQ to be smaller when RQ must
+                          // be large, e.g. notification)
+  uint32_t maxCqeNum{128};
+  uint32_t maxMsgSge{1};
+  uint32_t alignment{PAGESIZE};
+  bool onGpu{false};
+  bool withCompChannel{false};
+  bool enableSrq{false};
+  uint32_t atomicIbufSlots{512};  // Number of atomic internal buffer slots, each slot is 8B
+};
+
+struct GidSelectionResult {
+  int32_t gidIdx{-1};
+  union ibv_gid gid = {};
+  ibv_gid_type gidType{IBV_GID_TYPE_IB};
+  bool fromUser{false};
+  bool valid{false};
+};
+
+GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
+                                      const ibv_port_attr* portAttr, int32_t configuredGidIdx = -1);
+
+struct InfiniBandEndpointHandle {
+  uint32_t lid{0};
+  constexpr bool operator==(const InfiniBandEndpointHandle& rhs) const noexcept {
+    return lid == rhs.lid;
+  }
+};
+
+struct EthernetEndpointHandle {
+  uint8_t gid[16];
+  uint8_t mac[ETHERNET_LL_SIZE];
+  int32_t gidIdx{-1};
+
+  constexpr bool operator==(const EthernetEndpointHandle& rhs) const noexcept {
+    return std::equal(std::begin(gid), std::end(gid), std::begin(rhs.gid)) &&
+           std::equal(std::begin(mac), std::end(mac), std::begin(rhs.mac)) && gidIdx == rhs.gidIdx;
+  }
+};
+
+// TODO: add gid type
+struct RdmaEndpointHandle {
+  uint32_t psn{0};
+  uint32_t qpn{0};
+  uint32_t portId{0};
+  uint32_t maxSge{1};
+  InfiniBandEndpointHandle ib;
+  EthernetEndpointHandle eth;
+
+  constexpr bool operator==(const RdmaEndpointHandle& rhs) const noexcept {
+    return psn == rhs.psn && qpn == rhs.qpn && portId == rhs.portId && ib == rhs.ib &&
+           eth == rhs.eth;
+  }
+};
+
+using RdmaEndpointHandleVec = std::vector<RdmaEndpointHandle>;
+
+struct WorkQueueAttrs {
+  uint32_t wqeNum{0};
+  uint32_t wqeSize{0};
+  uint64_t wqSize{0};
+  uint32_t head{0};
+  uint32_t postIdx{0};
+  uint32_t wqeShift{0};
+  uint32_t offset{0};
+};
+
+// RdmaMemoryRegion is defined in application_device_types.hpp (included above).
+
+struct RdmaEndpoint {
+  RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
+  RdmaEndpointHandle handle;
+  // TODO(@ditian12): we should use an opaque handle to reference the actual transport context
+  // handles, for direct verbs it should be WorkQueueHandle/CompletionQueueHandle, for ib verbs, it
+  // should be ibv structures
+  core::WorkQueueHandle wqHandle;
+  core::CompletionQueueHandle cqHandle;
+  core::IBVerbsHandle ibvHandle;
+
+  // Atomic internal buffer (ibuf) - independent MR for atomic operations
+  core::IbufHandle atomicIbuf;
+
+  __device__ __host__ core::ProviderType GetProviderType() {
+    if (vendorId == RdmaDeviceVendorId::Mellanox) {
+      return core::ProviderType::MLX5;
+    } else if (vendorId == RdmaDeviceVendorId::Broadcom) {
+      return core::ProviderType::BNXT;
+    } else if (vendorId == RdmaDeviceVendorId::Pensando) {
+      return core::ProviderType::PSD;
+    } else {
+      printf("unknown vendorId %u", static_cast<uint32_t>(vendorId));
+      assert(false);
+    }
+    return core::ProviderType::Unknown;
+  }
+};
+
+class RdmaDevice;
+
+/* -------------------------------------------------------------------------- */
+/*                             Rdma Configurations                            */
+/* -------------------------------------------------------------------------- */
+
+std::optional<uint8_t> ReadRdmaServiceLevelEnv();
+std::optional<uint8_t> ReadRdmaTrafficClassEnv();
+std::optional<uint8_t> ReadIoServiceLevelEnv();
+std::optional<uint8_t> ReadIoTrafficClassEnv();
+bool ReadIoTrafficClassDisableEnv();
+
+bool ReadIbEnableRelaxedOrderingEnv();
+int MaybeAddRelaxedOrderingFlag(int accessFlag);
+
+/* -------------------------------------------------------------------------- */
+/*                              RdmaDeviceContext                             */
+/* -------------------------------------------------------------------------- */
+class RdmaDeviceContext {
+ public:
+  RdmaDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd);
+  virtual ~RdmaDeviceContext();
+
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegion(void* ptr, size_t size,
+                                                    int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
+                                                          int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual void DeregisterRdmaMemoryRegion(void* ptr);
+
+  // TODO: query gid entry by ibv_query_gid_table
+  virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
+    assert(false && "not implemented");
+    return RdmaEndpoint();
+  }
+  void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote, uint32_t qpId = 0) {
+    ConnectEndpoint(local.handle, remote.handle, qpId);
+  }
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                               uint32_t qpId = 0) {
+    assert(false && "not implemented");
+  }
+
+  ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
+
+  RdmaDevice* GetRdmaDevice();
+  ibv_context* GetIbvContext();
+  ibv_pd* GetIbvPd() { return pd; }
+  ibv_srq* GetIbvSrq() { return srq; }
+
+  uint16_t GetUdpSport(uint32_t qpId) const;
+
+ protected:
+  ibv_pd* pd{nullptr};
+  ibv_srq* srq{nullptr};
+  uint16_t qp_counter{0};
+  // Shared UDP sport configuration for all RDMA providers
+  uint16_t udp_sport_setting[RDMA_UDP_SPORT_ARRAY_SIZE];
+
+  // Initialize UDP sport configuration from environment variables
+  void InitializeUdpSportConfiguration();
+
+ private:
+  RdmaDevice* device;
+  std::unordered_map<void*, ibv_mr*> mrPool;
+};
+
+/* -------------------------------------------------------------------------- */
+/*                                 RdmaDevice                                 */
+/* -------------------------------------------------------------------------- */
+class RdmaDevice {
+ public:
+  RdmaDevice(ibv_device* device);
+  virtual ~RdmaDevice();
+
+  int GetDevicePortNum() const;
+  std::vector<uint32_t> GetActivePortIds() const;
+  const ibv_device_attr_ex* GetDeviceAttr() const;
+  const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* GetPortAttrMap() const;
+  const ibv_port_attr* GetPortAttr(uint32_t portId) const;
+
+  double ActiveGbps(uint32_t portId) const;
+  double TotalActiveGbps() const;
+
+  std::string Name() const;
+
+  virtual RdmaDeviceContext* CreateRdmaDeviceContext();
+  ibv_context* GetIbvContext() const { return defaultContext; }
+  ibv_device* GetIbvDevice() const { return device; }
+
+ protected:
+  friend class RdmaDeviceContext;
+
+  ibv_device* device;
+  ibv_context* defaultContext;
+
+  std::unique_ptr<ibv_device_attr_ex> deviceAttr;
+  std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>> portAttrMap;
+};
+
+using RdmaDeviceList = std::vector<RdmaDevice*>;
+using ActiveDevicePort = std::pair<RdmaDevice*, uint32_t>;
+using ActiveDevicePortList = std::vector<ActiveDevicePort>;
+
+ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList&);
+
+/* -------------------------------------------------------------------------- */
+/*                                 RdmaContext                                */
+/* -------------------------------------------------------------------------- */
+class RdmaContext {
+ public:
+  RdmaContext(RdmaBackendType);
+  ~RdmaContext();
+
+  const RdmaDeviceList& GetRdmaDeviceList() const;
+  int nums_device;
+
+ private:
+  RdmaDevice* RdmaDeviceFactory(ibv_device* inDevice);
+  void Initialize();
+
+ public:
+  RdmaBackendType backendType;
+
+ private:
+  ibv_device** deviceList{nullptr};
+  RdmaDeviceList rdmaDeviceList;
+};
+
+}  // namespace application
+}  // namespace mori
+
+namespace std {
+
+static std::ostream& operator<<(std::ostream& s,
+                                const mori::application::EthernetEndpointHandle handle) {
+  std::stringstream ss;
+  ss << "gid: " << std::hex;
+  for (int i = 0; i < sizeof(handle.gid); i++) {
+    ss << int(handle.gid[i]);
+  }
+  ss << ", mac: " << std::hex;
+  for (int i = 0; i < sizeof(handle.mac); i++) {
+    ss << int(handle.mac[i]);
+  }
+  ss << ", gidIdx: " << std::dec << handle.gidIdx;
+  s << ss.str();
+  return s;
+}
+
+static std::ostream& operator<<(std::ostream& s,
+                                const mori::application::RdmaEndpointHandle handle) {
+  std::stringstream ss;
+  ss << "psn: " << handle.psn << " qpn: " << handle.qpn << " ib [" << handle.ib.lid << "] "
+     << " eth [" << handle.eth << "]";
+  s << ss.str();
+  return s;
+}
+
+}  // namespace std

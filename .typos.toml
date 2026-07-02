@@ -1,0 +1,12 @@
+[default.extend-words]
+ASO = "ASO"
+aso = "aso"
+endien = "endien"
+fre = "fre"
+HSA = "HSA"
+
+[default]
+extend-ignore-identifiers-re = [
+    "HSA_.*",
+    "hsa_.*",
+]

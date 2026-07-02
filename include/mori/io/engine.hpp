@@ -1,0 +1,165 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+#pragma once
+
+#include <infiniband/verbs.h>
+
+#include <atomic>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "mori/application/transport/tcp/tcp.hpp"
+#include "mori/io/backend.hpp"
+#include "mori/io/common.hpp"
+
+namespace mori {
+namespace io {
+
+struct IOEngineConfig {
+  // Out of band TCP network configuration
+  std::string host;
+  uint16_t port;
+};
+
+class IOEngine;
+
+// This is a low latency session between a pair of memory descriptor, it caches
+// necessary meta data to avoid the overhead of
+class IOEngineSession {
+ public:
+  ~IOEngineSession() = default;
+
+  TransferUniqueId AllocateTransferUniqueId();
+  void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+            TransferUniqueId id);
+  void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+             TransferUniqueId id);
+
+  void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id);
+  void BatchWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                  TransferStatus* status, TransferUniqueId id);
+  bool Alive();
+
+  friend class IOEngine;
+
+ protected:
+  IOEngineSession() = default;
+
+  IOEngine* engine{nullptr};
+  std::shared_ptr<BackendSession> backendSess{nullptr};
+};
+
+class IOEngine {
+ public:
+  IOEngine(EngineKey, IOEngineConfig);
+  ~IOEngine();
+
+  void CreateBackend(BackendType, const BackendConfig&);
+  void RemoveBackend(BackendType);
+
+  EngineDesc GetEngineDesc() const { return desc; }
+
+  void RegisterRemoteEngine(const EngineDesc&);
+  void DeregisterRemoteEngine(const EngineDesc&);
+
+  MemoryDesc RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc);
+  void DeregisterMemory(const MemoryDesc& desc);
+
+  TransferUniqueId AllocateTransferUniqueId();
+  void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+            size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+  void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
+             size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+
+  void BatchRead(const MemDescVec& localDest, const BatchSizeVec& localOffsets,
+                 const MemDescVec& remoteSrc, const BatchSizeVec& remoteOffsets,
+                 const BatchSizeVec& sizes, TransferStatusPtrVec& status, TransferUniqueIdVec& ids);
+  void BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localOffsets,
+                  const MemDescVec& remoteDest, const BatchSizeVec& remoteOffsets,
+                  const BatchSizeVec& sizes, TransferStatusPtrVec& status,
+                  TransferUniqueIdVec& ids);
+  // Take the transfer status of an inbound op
+  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+  // Wait for all statuses with failure-wins precedence. Empty input succeeds.
+  StatusCode WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs = -1);
+
+  std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
+  void LoadScatterGatherModule(const std::string& hsacoPath);
+
+ private:
+  struct RouteCacheKey {
+    EngineKey remoteEngineKey;
+    MemoryLocationType localLoc;
+    MemoryLocationType remoteLoc;
+    int localDeviceId;
+    int remoteDeviceId;
+
+    bool operator==(const RouteCacheKey& rhs) const noexcept {
+      return remoteEngineKey == rhs.remoteEngineKey && localLoc == rhs.localLoc &&
+             remoteLoc == rhs.remoteLoc && localDeviceId == rhs.localDeviceId &&
+             remoteDeviceId == rhs.remoteDeviceId;
+    }
+  };
+
+  struct RouteCacheKeyHash {
+    std::size_t operator()(const RouteCacheKey& key) const noexcept {
+      std::size_t seed = 0;
+      auto hashCombine = [](std::size_t& s, std::size_t v) {
+        s ^= v + 0x9e3779b97f4a7c15ULL + (s << 6) + (s >> 2);
+      };
+      hashCombine(seed, std::hash<std::string>{}(key.remoteEngineKey));
+      hashCombine(seed, std::hash<int>{}(static_cast<int>(key.localLoc)));
+      hashCombine(seed, std::hash<int>{}(static_cast<int>(key.remoteLoc)));
+      hashCombine(seed, std::hash<int>{}(key.localDeviceId));
+      hashCombine(seed, std::hash<int>{}(key.remoteDeviceId));
+      return seed;
+    }
+  };
+
+  Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
+  bool SupportsXgmiBackendByP2P() const;
+  void EnsureXgmiBackendCreatedIfSupported();
+  void InvalidateRouteCache();
+  void UpdateRouteCache(const RouteCacheKey& key, BackendType backendType);
+  std::optional<BackendType> QueryRouteCache(const RouteCacheKey& key) const;
+  std::string ResolveNodeId(const std::string& hostname) const;
+
+ public:
+  IOEngineConfig config;
+  EngineDesc desc;
+
+ private:
+  std::atomic<uint32_t> nextTransferUid{0};
+  std::atomic<uint32_t> nextMemUid{0};
+  std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
+  std::unordered_map<BackendType, std::unique_ptr<Backend>> backends;
+  mutable std::shared_mutex routeCacheMu;
+  std::unordered_map<RouteCacheKey, BackendType, RouteCacheKeyHash> routeCache;
+};
+
+}  // namespace io
+}  // namespace mori
