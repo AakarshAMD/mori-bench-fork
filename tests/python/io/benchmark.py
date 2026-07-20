@@ -28,70 +28,123 @@ from mori.io import (
     IOEngine,
     EngineDesc,
     MemoryDesc,
-    MemoryLocationType,
     PollCqMode,
     RdmaBackendConfig,
     XgmiBackendConfig,
-    FabricBackendConfig,
-    fabric_alloc,
     set_log_level,
 )
 import argparse
-import ctypes
+from dataclasses import dataclass, field
 from enum import Enum
+import csv as _csv
+import math
 import os
 import time
 from prettytable import PrettyTable
 
 
-# --- Minimal HIP memcpy helpers (fabric buffers are raw VMM allocations, not
-# --- torch tensors, so we fill/verify them directly via the HIP runtime).
-_hip_lib = None
+@dataclass
+class IterTiming:
+    """Per-iteration wall-clock split (seconds).
+
+    total = post + wait for the single/batch paths. For the TARGET role (passive
+    one-sided RDMA peer) all fields stay 0.0.
+    """
+
+    total: float = 0.0
+    post: float = 0.0  # time submitting all WRs (ibv_post_send loop / batch call)
+    wait: float = 0.0  # time blocked in .Wait() on completions (CQ reap)
 
 
-def _hip():
-    global _hip_lib
-    if _hip_lib is None:
-        for name in ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"):
-            try:
-                _hip_lib = ctypes.CDLL(name)
-                break
-            except OSError:
-                continue
-        if _hip_lib is None:
-            raise RuntimeError("Could not load libamdhip64.so for fabric validation")
-        _hip_lib.hipMemcpy.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_size_t,
-            ctypes.c_int,
-        ]
-        _hip_lib.hipMemcpy.restype = ctypes.c_int
-        _hip_lib.hipSetDevice.argtypes = [ctypes.c_int]
-        _hip_lib.hipSetDevice.restype = ctypes.c_int
-        _hip_lib.hipDeviceSynchronize.restype = ctypes.c_int
-    return _hip_lib
+@dataclass
+class SweepResult:
+    """One sweep point (msg_size, batch_size) with full latency stats.
+
+    Latency fields are in microseconds; bandwidth fields in GB/s. `raw` keeps the
+    per-iteration timings (seconds) for optional --csv-raw dumping.
+    """
+
+    msg_size: int
+    batch_size: int
+    total_mem_mb: float
+    iters: int
+    min_us: float
+    avg_us: float
+    p50_us: float
+    p90_us: float
+    p99_us: float
+    max_us: float
+    std_us: float
+    avg_post_us: float
+    avg_wait_us: float
+    post_frac: float
+    wait_frac: float
+    max_bw: float  # GB/s computed from min e2e latency (best-case)
+    avg_bw: float  # GB/s computed from avg e2e latency
+    eff_pct: float  # achieved (max_bw) vs line rate, %, or -1 if unknown
+    # wait-only window (wire/completion): latency from wait component only
+    min_wait_us: float = 0.0
+    p50_wait_us: float = 0.0
+    p90_wait_us: float = 0.0
+    p99_wait_us: float = 0.0
+    max_wait_us: float = 0.0
+    std_wait_us: float = 0.0
+    max_bw_wait: float = 0.0  # GB/s from min wait time (best-case)
+    avg_bw_wait: float = 0.0  # GB/s from avg wait time
+    raw: list = field(default_factory=list)
 
 
-_HIP_MEMCPY_H2D = 1
-_HIP_MEMCPY_D2H = 2
+def _percentile(sorted_vals, pct):
+    """Linear-interpolation percentile on an already-sorted list (pct in [0,100])."""
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    rank = (pct / 100.0) * (len(sorted_vals) - 1)
+    lo = int(math.floor(rank))
+    hi = int(math.ceil(rank))
+    if lo == hi:
+        return sorted_vals[lo]
+    frac = rank - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
 
-def hip_fill(ptr: int, data: bytes, device: int):
-    h = _hip()
-    assert h.hipSetDevice(device) == 0
-    buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-    assert h.hipMemcpy(ctypes.c_void_p(ptr), buf, len(data), _HIP_MEMCPY_H2D) == 0
-    assert h.hipDeviceSynchronize() == 0
+def _latency_stats_us(durations_s):
+    """Min/avg/p50/p90/p99/max/stddev latency stats (microseconds) from seconds."""
+    if not durations_s:
+        return {
+            "min_us": 0.0,
+            "avg_us": 0.0,
+            "p50_us": 0.0,
+            "p90_us": 0.0,
+            "p99_us": 0.0,
+            "max_us": 0.0,
+            "std_us": 0.0,
+        }
+    n = len(durations_s)
+    sorted_us = sorted(v * 1e6 for v in durations_s)
+    min_us = min(sorted_us)
+    max_us = max(sorted_us)
+    avg_us = sum(sorted_us) / n
+    mean_us = avg_us
+    if n > 1:
+        var = sum((x - mean_us) ** 2 for x in sorted_us) / (n - 1)
+        std_us = math.sqrt(var)
+    else:
+        std_us = 0.0
+    return {
+        "min_us": min_us,
+        "avg_us": avg_us,
+        "p50_us": _percentile(sorted_us, 50),
+        "p90_us": _percentile(sorted_us, 90),
+        "p99_us": _percentile(sorted_us, 99),
+        "max_us": max_us,
+        "std_us": std_us,
+    }
 
 
-def hip_read(ptr: int, nbytes: int, device: int) -> bytes:
-    h = _hip()
-    assert h.hipSetDevice(device) == 0
-    buf = (ctypes.c_char * nbytes)()
-    assert h.hipMemcpy(buf, ctypes.c_void_p(ptr), nbytes, _HIP_MEMCPY_D2H) == 0
-    assert h.hipDeviceSynchronize() == 0
-    return bytes(buf)
+def _bw_gbps(total_mem_mb, duration_s):
+    return total_mem_mb / (10**3) / duration_s if duration_s > 0 else 0.0
 
 
 def parse_args():
@@ -99,10 +152,9 @@ def parse_args():
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["rdma", "xgmi", "fabric"],
+        choices=["rdma", "xgmi"],
         default="rdma",
-        help="Backend type: 'rdma' for cross-node RDMA, 'xgmi' for intra-node GPU-to-GPU, "
-        "'fabric' for cross-node scale-up UALink super-node (same vPOD) (default: rdma)",
+        help="Backend type: 'rdma' for cross-node, 'xgmi' for intra-node GPU-to-GPU (default: rdma)",
     )
     parser.add_argument(
         "--host",
@@ -167,15 +219,6 @@ def parse_args():
         type=int,
         default=2**20,
         help="Maximum message size when using --all sweep (default: 2**20)",
-    )
-    parser.add_argument(
-        "--sweep-step",
-        type=int,
-        default=0,
-        help="Linear step (bytes) for the --all sweep: message size goes "
-        "start, start+step, start+2*step, ... up to max. Default 0 = geometric "
-        "(double each step). Example: --sweep-start-size 1048576 "
-        "--sweep-max-size 33554432 --sweep-step 1048576 sweeps 1MiB..32MiB by 1MiB.",
     )
     parser.add_argument(
         "--all-batch",
@@ -260,22 +303,6 @@ def parse_args():
         help="Memory type for transfer buffers: 'gpu' (cuda) or 'cpu' (host) (default: gpu)",
     )
     parser.add_argument(
-        "--initiator-mem-type",
-        type=str,
-        default=None,
-        choices=["gpu", "cpu"],
-        help="Override buffer memory type on the INITIATOR side (default: --mem-type). "
-        "Combine with --target-mem-type for a mixed CPU<->GPU transfer, e.g. "
-        "--initiator-mem-type cpu --target-mem-type gpu (RDMA backend only).",
-    )
-    parser.add_argument(
-        "--target-mem-type",
-        type=str,
-        default=None,
-        choices=["gpu", "cpu"],
-        help="Override buffer memory type on the TARGET side (default: --mem-type).",
-    )
-    parser.add_argument(
         "--iters",
         type=int,
         default=128,
@@ -313,6 +340,46 @@ def parse_args():
         choices=["trace", "debug", "info", "warning", "error", "critical"],
         help="Log level options: 'trace', 'debug', 'info', 'warning', 'error', 'critical'",
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="Number of discarded warmup run_once() calls before each timed sweep "
+        "point (default: 2). Warmups never affect reported stats.",
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default="",
+        help="If set, write one summary row per (msg_size, batch_size) sweep point "
+        "with full latency/BW stats to this path (initiator/rank-0 only). Parent "
+        "dirs are created; file is overwritten with a header.",
+    )
+    parser.add_argument(
+        "--csv-raw",
+        type=str,
+        default="",
+        help="If set, dump one row per individual timed iteration "
+        "(msg_size, batch, iter_idx, duration_us, post_us, wait_us) to this path "
+        "for offline distribution/idle analysis (initiator/rank-0 only).",
+    )
+    parser.add_argument(
+        "--line-rate-gbps",
+        type=float,
+        default=0.0,
+        help="Optional theoretical line rate in Gb/s (bits). When > 0, an efficiency "
+        "%% column (achieved max BW vs line rate) is added to the CSV.",
+    )
+    parser.add_argument(
+        "--bw-mode",
+        type=str,
+        choices=["e2e", "wait_only"],
+        default="e2e",
+        help="Timing basis for PrettyTable Max/Avg BW and Min/Avg Lat columns: "
+        "'e2e' = post+wait (default, backward compatible); 'wait_only' = wait "
+        "component only. Summary/raw CSV always include both e2e and wait-only "
+        "metrics side by side.",
+    )
 
     args = parser.parse_args()
     return args
@@ -337,7 +404,6 @@ class MoriIoBenchmark:
         sweep_batch: bool = False,
         sweep_start_size: int = 8,
         sweep_max_size: int = 2**20,
-        sweep_step: int = 0,
         backend_type: str = "rdma",
         host: str = "",
         port: int = 0,
@@ -356,13 +422,16 @@ class MoriIoBenchmark:
         chunk_bytes: int = 65536,
         max_chunks: int = 64,
         mem_type: str = "gpu",
-        initiator_mem_type: str = None,
-        target_mem_type: str = None,
         src_gpu: int = 0,
         dst_gpu: int = 1,
         num_streams: int = 64,
         num_events: int = 64,
         xgmi_multiprocess: bool = False,
+        warmup: int = 2,
+        csv_path: str = "",
+        csv_raw_path: str = "",
+        line_rate_gbps: float = 0.0,
+        bw_mode: str = "e2e",
     ):
         self.op_type = op_type
         self.buffer_size = buffer_size
@@ -375,7 +444,6 @@ class MoriIoBenchmark:
         self.sweep_batch = sweep_batch
         self.sweep_start_size = sweep_start_size
         self.sweep_max_size = sweep_max_size
-        self.sweep_step = sweep_step
         self.backend_type = backend_type
 
         self.host = host
@@ -397,14 +465,20 @@ class MoriIoBenchmark:
         self.chunk_bytes = chunk_bytes
         self.max_chunks = max_chunks
         self.mem_type = mem_type
-        self.initiator_mem_type = initiator_mem_type or mem_type
-        self.target_mem_type = target_mem_type or mem_type
 
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
         self.num_streams = num_streams
         self.num_events = num_events
         self.xgmi_multiprocess = xgmi_multiprocess
+
+        self.warmup = max(0, warmup)
+        self.csv_path = csv_path
+        self.csv_raw_path = csv_raw_path
+        self.line_rate_gbps = line_rate_gbps
+        self.bw_mode = bw_mode
+        # Accumulated per-sweep-point results (initiator side), flushed to CSV at end.
+        self.results: list[SweepResult] = []
 
         if self.sweep:
             if self.sweep_start_size <= 0 or self.sweep_max_size <= 0:
@@ -416,8 +490,6 @@ class MoriIoBenchmark:
 
         if self.backend_type == "xgmi":
             self._setup_xgmi()
-        elif self.backend_type == "fabric":
-            self._setup_fabric()
         else:
             self._setup_rdma()
 
@@ -430,12 +502,6 @@ class MoriIoBenchmark:
         else:
             self.global_rank = self.role_rank + self.num_initiator_dev
             self.role = EngineRole.TARGET
-
-        self.mem_type = (
-            self.initiator_mem_type
-            if self.role is EngineRole.INITIATOR
-            else self.target_mem_type
-        )
 
         # When not batch_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
         total_elements = (
@@ -494,45 +560,6 @@ class MoriIoBenchmark:
                 self.dst_device, dtype=torch.float8_e4m3fnuz
             )
 
-    def _setup_fabric(self):
-        # Fabric mirrors the RDMA cross-node role model (2 nodes, gloo OOB), but
-        # the transferred buffer MUST be a fabric-exportable VMM allocation
-        # (fabric_alloc) rather than a torch tensor.
-        if self.mem_type != "gpu":
-            raise ValueError("fabric backend supports GPU memory only")
-        assert self.num_initiator_dev == self.num_target_dev
-        self.world_size = self.num_initiator_dev + self.num_target_dev
-        if self.node_rank == 0:
-            self.global_rank = self.role_rank
-            self.role = EngineRole.INITIATOR
-        else:
-            self.global_rank = self.role_rank + self.num_initiator_dev
-            self.role = EngineRole.TARGET
-
-        # 1 byte per element (matches the fp8/uint8 sizing used by the other paths).
-        total_elements = (
-            (self.buffer_size + 1) * self.transfer_batch_size
-            if not self.batch_contiguous
-            else self.buffer_size * self.transfer_batch_size
-        )
-        gpu_index = self.role_rank
-        if self.role is EngineRole.TARGET and self.target_dev_offset:
-            ndev = torch.cuda.device_count()
-            if ndev <= 0:
-                raise RuntimeError(
-                    "fabric setup: torch.cuda.device_count()==0 (no visible GPUs); "
-                    "cannot apply --target-dev-offset"
-                )
-            gpu_index = (self.role_rank + self.target_dev_offset) % ndev
-        self.device = torch.device("cuda", gpu_index)
-        self.fabric_nbytes = total_elements
-        self.fabric_ptr = fabric_alloc(self.fabric_nbytes, gpu_index)
-        if not self.fabric_ptr:
-            raise RuntimeError(
-                f"fabric_alloc failed for {self.fabric_nbytes} bytes on gpu {gpu_index}; "
-                "the device must be a UALink fabric-capable GPU in a ready vPOD"
-            )
-
     def print_config(self):
         print("MORI-IO Benchmark Configurations:")
         print(f"  backend: {self.backend_type.upper()}")
@@ -542,15 +569,6 @@ class MoriIoBenchmark:
             print(f"  xgmi_multiprocess: {self.xgmi_multiprocess}")
             print(f"  src_gpu: {self.src_gpu}")
             print(f"  dst_gpu: {self.dst_gpu}")
-            print(f"  num_streams: {self.num_streams}")
-            print(f"  num_events: {self.num_events}")
-        elif self.backend_type == "fabric":
-            print(f"  node_rank: {self.node_rank}")
-            print(f"  role: {self.role}")
-            print(f"  role_rank: {self.role_rank}")
-            print(f"  num_initiator_dev: {self.num_initiator_dev}")
-            print(f"  num_target_dev: {self.num_target_dev}")
-            print(f"  target_dev_offset: {self.target_dev_offset}")
             print(f"  num_streams: {self.num_streams}")
             print(f"  num_events: {self.num_events}")
         else:
@@ -581,6 +599,14 @@ class MoriIoBenchmark:
         print(f"  batch_contiguous: {self.batch_contiguous}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  iters: {self.iters}")
+        print(f"  warmup: {self.warmup}")
+        if self.csv_path:
+            print(f"  csv: {self.csv_path}")
+        if self.csv_raw_path:
+            print(f"  csv_raw: {self.csv_raw_path}")
+        if self.line_rate_gbps > 0:
+            print(f"  line_rate_gbps: {self.line_rate_gbps}")
+        print(f"  bw_mode: {self.bw_mode}")
         print()
 
     def _get_transfer_offsets(self, buffer_size, transfer_batch_size, batched):
@@ -622,63 +648,8 @@ class MoriIoBenchmark:
     def validate(self):
         if self.backend_type == "xgmi":
             self._validate_xgmi()
-        elif self.backend_type == "fabric":
-            self._validate_fabric()
         else:
             self._validate_rdma()
-
-    def _validate_fabric(self):
-        # Correctness spot-check decoupled from the (possibly strided/batched)
-        # perf pattern: target fills a known pattern, initiator transfers it over
-        # the fabric and both sides verify. Bounded to keep it cheap.
-        check = min(self.fabric_nbytes, 1 << 20)
-        tile = bytes(range(256))
-        pattern = (tile * (check // 256 + 1))[:check]
-        zero = bytes(check)
-        dev = self.device.index
-
-        if self.op_type == "read":
-            if self.role is EngineRole.TARGET:
-                hip_fill(self.fabric_ptr, pattern, dev)
-                dist.barrier()  # #1 target data ready
-                dist.barrier()  # #2 initiator finished
-            else:
-                hip_fill(self.fabric_ptr, zero, dev)
-                dist.barrier()  # #1 wait for target fill
-                status = self.engine.read(
-                    self.mem,
-                    0,
-                    self.target_mem,
-                    0,
-                    check,
-                    self.engine.allocate_transfer_uid(),
-                )
-                status.Wait()
-                assert status.Succeeded(), f"fabric read failed: {status.Message()}"
-                got = hip_read(self.fabric_ptr, check, dev)
-                assert got == pattern, "fabric READ validation: data mismatch"
-                dist.barrier()  # #2 done
-        else:  # write
-            if self.role is EngineRole.INITIATOR:
-                hip_fill(self.fabric_ptr, pattern, dev)
-                dist.barrier()  # #1 both ready
-                status = self.engine.write(
-                    self.mem,
-                    0,
-                    self.target_mem,
-                    0,
-                    check,
-                    self.engine.allocate_transfer_uid(),
-                )
-                status.Wait()
-                assert status.Succeeded(), f"fabric write failed: {status.Message()}"
-                dist.barrier()  # #2 signal target to verify
-            else:
-                hip_fill(self.fabric_ptr, zero, dev)
-                dist.barrier()  # #1 both ready
-                dist.barrier()  # #2 initiator wrote
-                got = hip_read(self.fabric_ptr, check, dev)
-                assert got == pattern, "fabric WRITE validation: data mismatch"
 
     def _validate_rdma(self):
         if self.role is EngineRole.INITIATOR:
@@ -768,8 +739,6 @@ class MoriIoBenchmark:
     def initialize(self):
         if self.backend_type == "xgmi":
             self._initialize_xgmi()
-        elif self.backend_type == "fabric":
-            self._initialize_fabric()
         else:
             self._initialize_rdma()
 
@@ -784,7 +753,6 @@ class MoriIoBenchmark:
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
-            enable_notification=False,
             enable_transfer_chunking=self.enable_chunking,
             chunk_bytes=self.chunk_bytes,
             max_chunks_per_transfer=self.max_chunks,
@@ -877,63 +845,13 @@ class MoriIoBenchmark:
             if self.enable_sess:
                 self.sess = self.engine.create_session(self.mem, self.target_mem)
 
-    def _initialize_fabric(self):
-        # Same OOB/role flow as RDMA (gloo desc exchange), but a FABRIC backend
-        # and register_memory() on the raw fabric_alloc pointer. The FABRIC
-        # backend has no TCP control plane; descriptors are exchanged via gloo.
-        config = IOEngineConfig(host="", port=0)
-        self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
-        fabric_config = FabricBackendConfig(
-            num_streams=self.num_streams,
-            num_events=self.num_events,
-        )
-        self.engine.create_backend(BackendType.FABRIC, fabric_config)
-
-        self.engine_desc = self.engine.get_engine_desc()
-        engine_desc_bytes = self.engine_desc.pack()
-
-        if self.role is EngineRole.INITIATOR:
-            for i in range(self.num_target_dev):
-                self.send_bytes(engine_desc_bytes, self.num_initiator_dev + i)
-            for i in range(self.num_target_dev):
-                peer_engine_desc_bytes = self.recv_bytes(self.num_initiator_dev + i)
-                peer_engine_desc = EngineDesc.unpack(peer_engine_desc_bytes)
-                self.engine.register_remote_engine(peer_engine_desc)
-        else:
-            for i in range(self.num_initiator_dev):
-                peer_engine_desc_bytes = self.recv_bytes(i)
-                peer_engine_desc = EngineDesc.unpack(peer_engine_desc_bytes)
-                self.engine.register_remote_engine(peer_engine_desc)
-            for i in range(self.num_initiator_dev):
-                self.send_bytes(engine_desc_bytes, i)
-
-        self.mem = self.engine.register_memory(
-            self.fabric_ptr,
-            self.fabric_nbytes,
-            self.device.index,
-            MemoryLocationType.GPU,
-        )
-
-        if self.role is EngineRole.TARGET:
-            mem_desc = self.mem.pack()
-            self.send_bytes(mem_desc, self.role_rank)
-        else:
-            target_mem_desc = self.recv_bytes(self.num_initiator_dev + self.role_rank)
-            self.target_mem = MemoryDesc.unpack(target_mem_desc)
-            self.sess = self.engine.create_session(self.mem, self.target_mem)
-            if self.sess is None:
-                raise RuntimeError(
-                    "create_session returned None for fabric: peers likely not in the "
-                    "same vPOD, or remote memory is not fabric-exportable"
-                )
-
     def run_single_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
         if (
-            self.backend_type in ("rdma", "fabric")
+            self.backend_type == "rdma"
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ) and self.role is EngineRole.TARGET:
-            return 0
+            return IterTiming()
 
         status_list = []
         transfer_uids = []
@@ -971,21 +889,26 @@ class MoriIoBenchmark:
         for i in range(transfer_batch_size):
             status = func(*arg_list[i])
             status_list.append(status)
+        post_end = time.time()  # all WRs submitted (host post cost)
         for status in status_list:
             status.Wait()
-        duration = time.time() - st
+        wait_end = time.time()  # all completions reaped (in-flight/wire window)
 
         for status in status_list:
             assert status.Succeeded(), f"Transfer failed: {status.Message()}"
-        return duration
+        return IterTiming(
+            total=wait_end - st,
+            post=post_end - st,
+            wait=wait_end - post_end,
+        )
 
     def run_batch_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
         if (
-            self.backend_type in ("rdma", "fabric")
+            self.backend_type == "rdma"
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ) and self.role is EngineRole.TARGET:
-            return 0
+            return IterTiming()
 
         # Strided offsets prevent merging: each transfer becomes a separate WR (to stress SQ / reproduce notify ENOMEM)
         offsets = self._get_transfer_offsets(
@@ -1025,12 +948,17 @@ class MoriIoBenchmark:
             st = time.time()
             transfer_status = func(*args)[0]
 
+        post_end = time.time()  # batch call returned (WRs submitted)
         transfer_status.Wait()
-        duration = time.time() - st
+        wait_end = time.time()  # batch completion reaped
         assert (
             transfer_status.Succeeded()
         ), f"Batch transfer failed: {transfer_status.Message()}"
-        return duration
+        return IterTiming(
+            total=wait_end - st,
+            post=post_end - st,
+            wait=wait_end - post_end,
+        )
 
     def run_once(self, buffer_size, transfer_batch_size):
         if self.enable_batch_transfer:
@@ -1039,26 +967,102 @@ class MoriIoBenchmark:
             return self.run_single_once(buffer_size, transfer_batch_size)
 
     def _run_and_compute(self, buffer_size, transfer_batch_size, iters):
-        latency = []
+        timings = []
         for _ in range(iters):
-            duration = self.run_once(buffer_size, transfer_batch_size)
-            latency.append(duration)
-
-        if self.role is EngineRole.TARGET and (
-            self.backend_type in ("rdma", "fabric")
-            or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
-        ):
-            return 0, 0, 0, 0, 0
+            timings.append(self.run_once(buffer_size, transfer_batch_size))
 
         total_mem_mb = buffer_size * transfer_batch_size / (10**6)
-        avg_duration = sum(latency) / len(latency)
-        min_duration = min(latency)
-        avg_duration_us = avg_duration * (10**6)
-        min_duration_us = min_duration * (10**6)
-        avg_bw = total_mem_mb / (10**3) / avg_duration
-        max_bw = total_mem_mb / (10**3) / min_duration
 
-        return total_mem_mb, avg_duration_us, min_duration_us, avg_bw, max_bw
+        if self.role is EngineRole.TARGET and (
+            self.backend_type == "rdma"
+            or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
+        ):
+            return SweepResult(
+                msg_size=buffer_size,
+                batch_size=transfer_batch_size,
+                total_mem_mb=total_mem_mb,
+                iters=iters,
+                min_us=0.0,
+                avg_us=0.0,
+                p50_us=0.0,
+                p90_us=0.0,
+                p99_us=0.0,
+                max_us=0.0,
+                std_us=0.0,
+                avg_post_us=0.0,
+                avg_wait_us=0.0,
+                post_frac=0.0,
+                wait_frac=0.0,
+                max_bw=0.0,
+                avg_bw=0.0,
+                eff_pct=-1.0,
+                min_wait_us=0.0,
+                p50_wait_us=0.0,
+                p90_wait_us=0.0,
+                p99_wait_us=0.0,
+                max_wait_us=0.0,
+                std_wait_us=0.0,
+                max_bw_wait=0.0,
+                avg_bw_wait=0.0,
+            )
+
+        totals = [t.total for t in timings]
+        posts = [t.post for t in timings]
+        waits = [t.wait for t in timings]
+        n = len(totals)
+
+        e2e_stats = _latency_stats_us(totals)
+        wait_stats = _latency_stats_us(waits)
+
+        avg_duration = sum(totals) / n
+        min_duration = min(totals)
+        avg_duration_us = e2e_stats["avg_us"]
+        avg_post_us = (sum(posts) / n) * 1e6
+        avg_wait_us = (sum(waits) / n) * 1e6
+        post_frac = (avg_post_us / avg_duration_us) if avg_duration_us > 0 else 0.0
+        wait_frac = (avg_wait_us / avg_duration_us) if avg_duration_us > 0 else 0.0
+
+        avg_bw = _bw_gbps(total_mem_mb, avg_duration)
+        max_bw = _bw_gbps(total_mem_mb, min_duration)
+        min_wait_s = min(waits) if waits else 0.0
+        avg_wait_s = sum(waits) / n if n else 0.0
+        max_bw_wait = _bw_gbps(total_mem_mb, min_wait_s)
+        avg_bw_wait = _bw_gbps(total_mem_mb, avg_wait_s)
+        eff_pct = (
+            (max_bw * 8.0 / self.line_rate_gbps) * 100.0
+            if self.line_rate_gbps > 0
+            else -1.0
+        )
+
+        return SweepResult(
+            msg_size=buffer_size,
+            batch_size=transfer_batch_size,
+            total_mem_mb=total_mem_mb,
+            iters=iters,
+            min_us=e2e_stats["min_us"],
+            avg_us=e2e_stats["avg_us"],
+            p50_us=e2e_stats["p50_us"],
+            p90_us=e2e_stats["p90_us"],
+            p99_us=e2e_stats["p99_us"],
+            max_us=e2e_stats["max_us"],
+            std_us=e2e_stats["std_us"],
+            avg_post_us=avg_post_us,
+            avg_wait_us=avg_wait_us,
+            post_frac=post_frac,
+            wait_frac=wait_frac,
+            max_bw=max_bw,
+            avg_bw=avg_bw,
+            eff_pct=eff_pct,
+            min_wait_us=wait_stats["min_us"],
+            p50_wait_us=wait_stats["p50_us"],
+            p90_wait_us=wait_stats["p90_us"],
+            p99_wait_us=wait_stats["p99_us"],
+            max_wait_us=wait_stats["max_us"],
+            std_wait_us=wait_stats["std_us"],
+            max_bw_wait=max_bw_wait,
+            avg_bw_wait=avg_bw_wait,
+            raw=timings,
+        )
 
     def _get_table_title(self):
         if self.backend_type == "xgmi":
@@ -1066,13 +1070,51 @@ class MoriIoBenchmark:
                 return f"XGMI Multiprocess Benchmark: Rank {self.role_rank} ({self.role.name})"
             else:
                 return f"XGMI Benchmark: GPU{self.src_gpu} -> GPU{self.dst_gpu}"
-        elif self.backend_type == "fabric":
-            return f"FABRIC Benchmark: Initiator Rank {self.role_rank}"
         else:
             return f"RDMA Benchmark: Initiator Rank {self.role_rank}"
 
+    def _is_reporting_side(self):
+        return (
+            self.backend_type == "xgmi" and not self.xgmi_multiprocess
+        ) or self.role is EngineRole.INITIATOR
+
+    def _measure_point(self, buffer_size, transfer_batch_size, table):
+        """Barrier (if needed), time one sweep point, add its table row, and record
+        the SweepResult for CSV output. Returns the SweepResult."""
+        if self.backend_type == "rdma" or (
+            self.backend_type == "xgmi" and self.xgmi_multiprocess
+        ):
+            dist.barrier()
+        res = self._run_and_compute(buffer_size, transfer_batch_size, self.iters)
+        if self.bw_mode == "wait_only":
+            table_max_bw = res.max_bw_wait
+            table_avg_bw = res.avg_bw_wait
+            table_min_lat = res.min_wait_us
+            table_avg_lat = res.avg_wait_us
+        else:
+            table_max_bw = res.max_bw
+            table_avg_bw = res.avg_bw
+            table_min_lat = res.min_us
+            table_avg_lat = res.avg_us
+        table.add_row(
+            [
+                buffer_size,
+                transfer_batch_size,
+                f"{res.total_mem_mb:.2f}",
+                f"{table_max_bw:.2f}",
+                f"{table_avg_bw:.2f}",
+                f"{table_min_lat:.2f}",
+                f"{table_avg_lat:.2f}",
+            ]
+        )
+        if self._is_reporting_side():
+            self.results.append(res)
+        return res
+
     def _run_benchmark_loop(self):
-        self.run_once(self.buffer_size, self.transfer_batch_size)
+        # Discarded warmup transfers (default 2). Warmups never affect stats.
+        for _ in range(self.warmup):
+            self.run_once(self.buffer_size, self.transfer_batch_size)
 
         table = PrettyTable(
             field_names=[
@@ -1091,83 +1133,160 @@ class MoriIoBenchmark:
             cur_size = self.sweep_start_size
             max_size = self.sweep_max_size
             while cur_size <= max_size:
-                if self.backend_type in ("rdma", "fabric") or (
-                    self.backend_type == "xgmi" and self.xgmi_multiprocess
-                ):
-                    dist.barrier()
-                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                    self._run_and_compute(
-                        cur_size, self.transfer_batch_size, self.iters
-                    )
-                )
-                table.add_row(
-                    [
-                        cur_size,
-                        self.transfer_batch_size,
-                        f"{total_mem_mb:.2f}",
-                        f"{max_bw:.2f}",
-                        f"{avg_bw:.2f}",
-                        f"{min_duration:.2f}",
-                        f"{avg_duration:.2f}",
-                    ]
-                )
-                if self.sweep_step > 0:
-                    cur_size += self.sweep_step
-                else:
-                    cur_size *= 2
+                self._measure_point(cur_size, self.transfer_batch_size, table)
+                cur_size *= 2
         elif self.sweep_batch:
             cur_transfer_batch_size = 1
             max_transfer_batch_size = 32768
             while cur_transfer_batch_size <= max_transfer_batch_size:
-                if self.backend_type in ("rdma", "fabric") or (
-                    self.backend_type == "xgmi" and self.xgmi_multiprocess
-                ):
-                    dist.barrier()
-                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                    self._run_and_compute(
-                        self.buffer_size, cur_transfer_batch_size, self.iters
-                    )
-                )
-                table.add_row(
-                    [
-                        self.buffer_size,
-                        cur_transfer_batch_size,
-                        f"{total_mem_mb:.2f}",
-                        f"{max_bw:.2f}",
-                        f"{avg_bw:.2f}",
-                        f"{min_duration:.2f}",
-                        f"{avg_duration:.2f}",
-                    ]
-                )
+                self._measure_point(self.buffer_size, cur_transfer_batch_size, table)
                 cur_transfer_batch_size *= 2
         else:
-            total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                self._run_and_compute(
-                    self.buffer_size, self.transfer_batch_size, self.iters
+            self._measure_point(self.buffer_size, self.transfer_batch_size, table)
+
+        if self._is_reporting_side():
+            print(table)
+            self._maybe_write_csv()
+
+    def _maybe_write_csv(self):
+        if self.csv_path:
+            self._write_summary_csv(self.csv_path)
+        if self.csv_raw_path:
+            self._write_raw_csv(self.csv_raw_path)
+
+    def _csv_config_cols(self):
+        """Config columns echoed into every CSV row (dict of name->value)."""
+        return {
+            "backend": self.backend_type,
+            "op_type": self.op_type,
+            "mem_type": self.mem_type,
+            "enable_batch": int(self.enable_batch_transfer),
+            "batch_contiguous": int(self.batch_contiguous),
+            "enable_sess": int(self.enable_sess),
+            "num_qp_per_transfer": self.num_qp_per_transfer,
+            "num_worker_threads": self.num_worker_threads,
+            "enable_chunking": int(self.enable_chunking),
+            "chunk_bytes": self.chunk_bytes,
+            "max_chunks": self.max_chunks,
+            "poll_cq_mode": (
+                "polling" if self.poll_cq_mode == PollCqMode.POLLING else "event"
+            ),
+        }
+
+    def _write_summary_csv(self, path):
+        cfg = self._csv_config_cols()
+        cfg_keys = list(cfg.keys())
+        stat_keys = [
+            "msg_size_B",
+            "batch_size",
+            "total_MB",
+            "iters",
+            "min_lat_us",
+            "avg_lat_us",
+            "p50_us",
+            "p90_us",
+            "p99_us",
+            "max_us",
+            "std_us",
+            "avg_post_us",
+            "avg_wait_us",
+            "post_frac",
+            "wait_frac",
+            "max_bw_gbps",
+            "avg_bw_gbps",
+            "min_lat_wait_us",
+            "avg_lat_wait_us",
+            "p50_wait_us",
+            "p90_wait_us",
+            "p99_wait_us",
+            "max_wait_us",
+            "std_wait_us",
+            "max_bw_wait_gb_s",
+            "avg_bw_wait_gb_s",
+            "eff_pct",
+        ]
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(cfg_keys + stat_keys)
+            for r in self.results:
+                w.writerow(
+                    [cfg[k] for k in cfg_keys]
+                    + [
+                        r.msg_size,
+                        r.batch_size,
+                        f"{r.total_mem_mb:.6f}",
+                        r.iters,
+                        f"{r.min_us:.3f}",
+                        f"{r.avg_us:.3f}",
+                        f"{r.p50_us:.3f}",
+                        f"{r.p90_us:.3f}",
+                        f"{r.p99_us:.3f}",
+                        f"{r.max_us:.3f}",
+                        f"{r.std_us:.3f}",
+                        f"{r.avg_post_us:.3f}",
+                        f"{r.avg_wait_us:.3f}",
+                        f"{r.post_frac:.4f}",
+                        f"{r.wait_frac:.4f}",
+                        f"{r.max_bw:.3f}",
+                        f"{r.avg_bw:.3f}",
+                        f"{r.min_wait_us:.3f}",
+                        f"{r.avg_wait_us:.3f}",
+                        f"{r.p50_wait_us:.3f}",
+                        f"{r.p90_wait_us:.3f}",
+                        f"{r.p99_wait_us:.3f}",
+                        f"{r.max_wait_us:.3f}",
+                        f"{r.std_wait_us:.3f}",
+                        f"{r.max_bw_wait:.3f}",
+                        f"{r.avg_bw_wait:.3f}",
+                        f"{r.eff_pct:.2f}",
+                    ]
                 )
-            )
-            table.add_row(
+        print(f"[benchmark] wrote summary CSV ({len(self.results)} rows): {path}")
+
+    def _write_raw_csv(self, path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        n_rows = 0
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(
                 [
-                    self.buffer_size,
-                    self.transfer_batch_size,
-                    f"{total_mem_mb:.2f}",
-                    f"{max_bw:.2f}",
-                    f"{avg_bw:.2f}",
-                    f"{min_duration:.2f}",
-                    f"{avg_duration:.2f}",
+                    "msg_size_B",
+                    "batch_size",
+                    "iter_idx",
+                    "duration_us",
+                    "post_us",
+                    "wait_us",
+                    "bw_e2e_gb_s",
+                    "bw_wait_gb_s",
                 ]
             )
-
-        if (
-            self.backend_type == "xgmi" and not self.xgmi_multiprocess
-        ) or self.role is EngineRole.INITIATOR:
-            print(table)
+            for r in self.results:
+                total_bytes = r.msg_size * r.batch_size
+                total_mem_mb = total_bytes / (10**6)
+                for i, t in enumerate(r.raw):
+                    bw_e2e = _bw_gbps(total_mem_mb, t.total)
+                    bw_wait = _bw_gbps(total_mem_mb, t.wait)
+                    w.writerow(
+                        [
+                            r.msg_size,
+                            r.batch_size,
+                            i,
+                            f"{t.total * 1e6:.3f}",
+                            f"{t.post * 1e6:.3f}",
+                            f"{t.wait * 1e6:.3f}",
+                            f"{bw_e2e:.3f}",
+                            f"{bw_wait:.3f}",
+                        ]
+                    )
+                    n_rows += 1
+        print(f"[benchmark] wrote raw per-iteration CSV ({n_rows} rows): {path}")
 
     def run(self):
         if self.backend_type == "xgmi":
             self._run_xgmi()
         else:
-            self._run_distributed()
+            self._run_rdma()
 
     def _run_xgmi(self):
         if self.xgmi_multiprocess:
@@ -1195,8 +1314,7 @@ class MoriIoBenchmark:
             self.validate()
             self._run_benchmark_loop()
 
-    def _run_distributed(self):
-        # Shared cross-node driver for RDMA and FABRIC (2-node gloo OOB).
+    def _run_rdma(self):
         context_device_id = (
             self.device.index
             if hasattr(self, "device") and self.device.index is not None
@@ -1240,7 +1358,6 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         sweep_batch=args.all_batch,
         sweep_start_size=args.sweep_start_size,
         sweep_max_size=args.sweep_max_size,
-        sweep_step=args.sweep_step,
         backend_type="xgmi",
         node_rank=node_rank,
         rank_in_node=local_rank,
@@ -1249,6 +1366,11 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         num_streams=args.num_streams,
         num_events=args.num_events,
         xgmi_multiprocess=True,
+        warmup=args.warmup,
+        csv_path=args.csv,
+        csv_raw_path=args.csv_raw,
+        line_rate_gbps=args.line_rate_gbps,
+        bw_mode=args.bw_mode,
     )
     bench.print_config()
     bench.run()
@@ -1275,8 +1397,7 @@ def benchmark_engine(local_rank, node_rank, args):
         sweep_batch=args.all_batch,
         sweep_start_size=args.sweep_start_size,
         sweep_max_size=args.sweep_max_size,
-        sweep_step=args.sweep_step,
-        backend_type=args.backend,  # "rdma" or "fabric" (both use this driver)
+        backend_type="rdma",
         host=args.host,
         port=0,
         node_rank=node_rank,
@@ -1294,10 +1415,11 @@ def benchmark_engine(local_rank, node_rank, args):
         chunk_bytes=args.chunk_bytes,
         max_chunks=args.max_chunks,
         mem_type=args.mem_type,
-        initiator_mem_type=args.initiator_mem_type,
-        target_mem_type=args.target_mem_type,
-        num_streams=args.num_streams,
-        num_events=args.num_events,
+        warmup=args.warmup,
+        csv_path=args.csv,
+        csv_raw_path=args.csv_raw,
+        line_rate_gbps=args.line_rate_gbps,
+        bw_mode=args.bw_mode,
     )
     bench.print_config()
     bench.run()
@@ -1349,20 +1471,23 @@ def benchmark_xgmi(args):
             sweep_batch=args.all_batch,
             sweep_start_size=args.sweep_start_size,
             sweep_max_size=args.sweep_max_size,
-            sweep_step=args.sweep_step,
             backend_type="xgmi",
             src_gpu=args.src_gpu,
             dst_gpu=args.dst_gpu,
             num_streams=args.num_streams,
             num_events=args.num_events,
             xgmi_multiprocess=False,
+            warmup=args.warmup,
+            csv_path=args.csv,
+            csv_raw_path=args.csv_raw,
+            line_rate_gbps=args.line_rate_gbps,
+            bw_mode=args.bw_mode,
         )
         bench.print_config()
         bench.run()
 
 
-def benchmark_distributed(args):
-    # Cross-node driver shared by RDMA and FABRIC backends.
+def benchmark_rdma(args):
     if args.all:
         if args.sweep_start_size > args.sweep_max_size:
             raise ValueError(
@@ -1393,7 +1518,7 @@ def benchmark():
     if args.backend == "xgmi":
         benchmark_xgmi(args)
     else:
-        benchmark_distributed(args)
+        benchmark_rdma(args)
 
 
 if __name__ == "__main__":
