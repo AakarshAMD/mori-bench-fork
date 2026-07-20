@@ -151,6 +151,20 @@ class MoriRoctxRange {
       active_ = true;
     }
   }
+  // ADDITIVE: host-post anchor variant that also carries the whole-call WR
+  // count (pre-merge request count, i.e. sizes.size() at the RdmaBatchReadWrite
+  // call site -- the same "known at entry, from the sizes vector" granularity
+  // already used for bytes above). Keeps id= LAST:
+  // "<name> bytes=<N> wrs=<M> id=<id>".
+  MoriRoctxRange(const char* name, uint64_t id, uint64_t bytes, uint64_t wrs) {
+    auto& a = roctx_detail::api();
+    if (a.enabled) {
+      std::string s = std::string(name) + " bytes=" + std::to_string(bytes) +
+                      " wrs=" + std::to_string(wrs) + " id=" + std::to_string(id);
+      a.push(s.c_str());
+      active_ = true;
+    }
+  }
   ~MoriRoctxRange() {
     if (active_) {
       auto& a = roctx_detail::api();
@@ -171,15 +185,26 @@ inline void MoriRoctxMark(const std::string& msg) {
 
 // --- ASYNC post->cq KV-transfer ranges (MORI_ROCTX_TRANSFER) ------------------
 // Start an async range for a SIGNALED WR at post time. Keyed by (ledger,recordId).
+// ADDITIVE: `wrs` carries epWrsSinceSignal[epId] at the signal point -- the
+// number of WRs (across possibly several RdmaBatchReadWrite calls, since
+// unsignaled chunks roll forward until the next signal) this one signaled
+// completion covers. Placed BEFORE id= (same rule as bytes=) so end-anchored
+// id= parsers keep matching: "<name> bytes=<N> wrs=<M> id=<id>".
+// ADDITIVE: `merged` carries epMergedSinceSignal[epId] at the signal point --
+// the pre-merge logical request count coalesced into this signaled segment's
+// WRs (same accumulation window as wrs=). Placed BEFORE id= (same rule as
+// bytes=/wrs=): "<name> bytes=<N> wrs=<M> merged=<K> id=<id>".
 inline void MoriRoctxTransferStart(const void* ledger, std::uint64_t recordId,
                                    std::uint64_t transferId, bool isRead,
-                                   std::uint64_t bytes = 0) {
+                                   std::uint64_t bytes = 0, std::uint64_t wrs = 0,
+                                   std::uint64_t merged = 0) {
   auto& a = roctx_detail::api();
   if (!a.transfer_enabled || a.range_start == nullptr || ledger == nullptr) return;
-  // bytes= placed BEFORE id= so the end-anchored id= parsers keep matching.
+  // bytes=/wrs=/merged= placed BEFORE id= so the end-anchored id= parsers keep matching.
   std::string s =
       std::string(isRead ? "mori.rdma.kv_transfer.read" : "mori.rdma.kv_transfer") +
-      " bytes=" + std::to_string(bytes) + " id=" + std::to_string(transferId);
+      " bytes=" + std::to_string(bytes) + " wrs=" + std::to_string(wrs) +
+      " merged=" + std::to_string(merged) + " id=" + std::to_string(transferId);
   roctx_detail::roctx_range_id_t rid = a.range_start(s.c_str());
   auto& t = roctx_detail::transfer_ranges();
   std::lock_guard<std::mutex> lk(t.mu);

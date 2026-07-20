@@ -398,10 +398,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   // ADDITIVE (MORI_ROCTX=1): brackets the host ibv_post_send loop for this RDMA
   // batch (write = the KV send on the prefill sender; read also routes here).
   // bytes= carries the whole-call payload (sum of the per-request sizes).
+  // wrs= carries the whole-call pre-merge request count (sizes.size()) -- the
+  // same "known at entry, from the sizes vector" granularity as bytes=; this is
+  // an upper bound on the actual posted WR count (merging can only reduce it).
   mori::io::MoriRoctxRange _mori_roctx_(
       isRead ? "mori.rdma.batch_post.read" : "mori.rdma.batch_post.write",
       static_cast<uint64_t>(id),
-      std::accumulate(sizes.begin(), sizes.end(), static_cast<uint64_t>(0)));
+      std::accumulate(sizes.begin(), sizes.end(), static_cast<uint64_t>(0)),
+      static_cast<uint64_t>(sizes.size()));
 
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
     return {StatusCode::ERR_INVALID_ARGS,
@@ -601,7 +605,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       // the synchronous host-post anchor above (us).
       mori::io::MoriRoctxTransferStart(eps[epId].ledger.get(), recordId,
                                        static_cast<uint64_t>(id), isRead,
-                                       static_cast<uint64_t>(epBytesSinceSignal[epId]));
+                                       static_cast<uint64_t>(epBytesSinceSignal[epId]),
+                                       static_cast<uint64_t>(epWrsSinceSignal[epId]),
+                                       static_cast<uint64_t>(epMergedSinceSignal[epId]));
     }
 
     struct ibv_send_wr* badWr = nullptr;
