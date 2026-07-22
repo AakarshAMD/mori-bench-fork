@@ -1,0 +1,2 @@
+# Runtime dependency for tests/python/io/benchmark.py.
+prettytable>=3.10,<4

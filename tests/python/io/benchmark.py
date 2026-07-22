@@ -34,10 +34,117 @@ from mori.io import (
     set_log_level,
 )
 import argparse
+from dataclasses import dataclass, field
 from enum import Enum
+import csv as _csv
+import math
 import os
 import time
 from prettytable import PrettyTable
+
+
+@dataclass
+class IterTiming:
+    """Per-iteration wall-clock split (seconds).
+
+    total = post + wait for the single/batch paths. For the TARGET role (passive
+    one-sided RDMA peer) all fields stay 0.0.
+    """
+
+    total: float = 0.0
+    post: float = 0.0  # time submitting all WRs (ibv_post_send loop / batch call)
+    wait: float = 0.0  # time blocked in .Wait() on completions (CQ reap)
+
+
+@dataclass
+class SweepResult:
+    """One sweep point (msg_size, batch_size) with full latency stats.
+
+    Latency fields are in microseconds; bandwidth fields in GB/s. `raw` keeps the
+    per-iteration timings (seconds) for optional --csv-raw dumping.
+    """
+
+    msg_size: int
+    batch_size: int
+    total_mem_mb: float
+    iters: int
+    min_us: float
+    avg_us: float
+    p50_us: float
+    p90_us: float
+    p99_us: float
+    max_us: float
+    std_us: float
+    avg_post_us: float
+    avg_wait_us: float
+    post_frac: float
+    wait_frac: float
+    max_bw: float  # GB/s computed from min e2e latency (best-case)
+    avg_bw: float  # GB/s computed from avg e2e latency
+    eff_pct: float  # achieved (max_bw) vs line rate, %, or -1 if unknown
+    # wait-only window (wire/completion): latency from wait component only
+    min_wait_us: float = 0.0
+    p50_wait_us: float = 0.0
+    p90_wait_us: float = 0.0
+    p99_wait_us: float = 0.0
+    max_wait_us: float = 0.0
+    std_wait_us: float = 0.0
+    max_bw_wait: float = 0.0  # GB/s from min wait time (best-case)
+    avg_bw_wait: float = 0.0  # GB/s from avg wait time
+    raw: list = field(default_factory=list)
+
+
+def _percentile(sorted_vals, pct):
+    """Linear-interpolation percentile on an already-sorted list (pct in [0,100])."""
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    rank = (pct / 100.0) * (len(sorted_vals) - 1)
+    lo = int(math.floor(rank))
+    hi = int(math.ceil(rank))
+    if lo == hi:
+        return sorted_vals[lo]
+    frac = rank - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+def _latency_stats_us(durations_s):
+    """Min/avg/p50/p90/p99/max/stddev latency stats (microseconds) from seconds."""
+    if not durations_s:
+        return {
+            "min_us": 0.0,
+            "avg_us": 0.0,
+            "p50_us": 0.0,
+            "p90_us": 0.0,
+            "p99_us": 0.0,
+            "max_us": 0.0,
+            "std_us": 0.0,
+        }
+    n = len(durations_s)
+    sorted_us = sorted(v * 1e6 for v in durations_s)
+    min_us = min(sorted_us)
+    max_us = max(sorted_us)
+    avg_us = sum(sorted_us) / n
+    mean_us = avg_us
+    if n > 1:
+        var = sum((x - mean_us) ** 2 for x in sorted_us) / (n - 1)
+        std_us = math.sqrt(var)
+    else:
+        std_us = 0.0
+    return {
+        "min_us": min_us,
+        "avg_us": avg_us,
+        "p50_us": _percentile(sorted_us, 50),
+        "p90_us": _percentile(sorted_us, 90),
+        "p99_us": _percentile(sorted_us, 99),
+        "max_us": max_us,
+        "std_us": std_us,
+    }
+
+
+def _bw_gbps(total_mem_mb, duration_s):
+    return total_mem_mb / (10**3) / duration_s if duration_s > 0 else 0.0
 
 
 def parse_args():
@@ -225,6 +332,46 @@ def parse_args():
         choices=["trace", "debug", "info", "warning", "error", "critical"],
         help="Log level options: 'trace', 'debug', 'info', 'warning', 'error', 'critical'",
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="Number of discarded warmup run_once() calls before each timed sweep "
+        "point (default: 2). Warmups never affect reported stats.",
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default="",
+        help="If set, write one summary row per (msg_size, batch_size) sweep point "
+        "with full latency/BW stats to this path (initiator/rank-0 only). Parent "
+        "dirs are created; file is overwritten with a header.",
+    )
+    parser.add_argument(
+        "--csv-raw",
+        type=str,
+        default="",
+        help="If set, dump one row per individual timed iteration "
+        "(msg_size, batch, iter_idx, duration_us, post_us, wait_us) to this path "
+        "for offline distribution/idle analysis (initiator/rank-0 only).",
+    )
+    parser.add_argument(
+        "--line-rate-gbps",
+        type=float,
+        default=0.0,
+        help="Optional theoretical line rate in Gb/s (bits). When > 0, an efficiency "
+        "%% column (achieved max BW vs line rate) is added to the CSV.",
+    )
+    parser.add_argument(
+        "--bw-mode",
+        type=str,
+        choices=["e2e", "wait_only"],
+        default="e2e",
+        help="Timing basis for PrettyTable Max/Avg BW and Min/Avg Lat columns: "
+        "'e2e' = post+wait (default, backward compatible); 'wait_only' = wait "
+        "component only. Summary/raw CSV always include both e2e and wait-only "
+        "metrics side by side.",
+    )
 
     args = parser.parse_args()
     return args
@@ -271,6 +418,11 @@ class MoriIoBenchmark:
         num_streams: int = 64,
         num_events: int = 64,
         xgmi_multiprocess: bool = False,
+        warmup: int = 2,
+        csv_path: str = "",
+        csv_raw_path: str = "",
+        line_rate_gbps: float = 0.0,
+        bw_mode: str = "e2e",
     ):
         self.op_type = op_type
         self.buffer_size = buffer_size
@@ -309,6 +461,14 @@ class MoriIoBenchmark:
         self.num_streams = num_streams
         self.num_events = num_events
         self.xgmi_multiprocess = xgmi_multiprocess
+
+        self.warmup = max(0, warmup)
+        self.csv_path = csv_path
+        self.csv_raw_path = csv_raw_path
+        self.line_rate_gbps = line_rate_gbps
+        self.bw_mode = bw_mode
+        # Accumulated per-sweep-point results (initiator side), flushed to CSV at end.
+        self.results = []
 
         if self.sweep:
             if self.sweep_start_size <= 0 or self.sweep_max_size <= 0:
@@ -423,6 +583,12 @@ class MoriIoBenchmark:
         print(f"  batch_contiguous: {self.batch_contiguous}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  iters: {self.iters}")
+        print(f"  warmup: {self.warmup}")
+        print(f"  bw_mode: {self.bw_mode}")
+        if self.csv_path:
+            print(f"  csv: {self.csv_path}")
+        if self.csv_raw_path:
+            print(f"  csv_raw: {self.csv_raw_path}")
         print()
 
     def _get_transfer_offsets(self, buffer_size, transfer_batch_size, batched):
@@ -667,7 +833,7 @@ class MoriIoBenchmark:
             self.backend_type == "rdma"
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ) and self.role is EngineRole.TARGET:
-            return 0
+            return IterTiming()
 
         status_list = []
         transfer_uids = []
@@ -705,13 +871,18 @@ class MoriIoBenchmark:
         for i in range(transfer_batch_size):
             status = func(*arg_list[i])
             status_list.append(status)
+        post_end = time.time()  # all WRs submitted (host post cost)
         for status in status_list:
             status.Wait()
-        duration = time.time() - st
+        wait_end = time.time()  # all completions reaped (in-flight/wire window)
 
         for status in status_list:
             assert status.Succeeded(), f"Transfer failed: {status.Message()}"
-        return duration
+        return IterTiming(
+            total=wait_end - st,
+            post=post_end - st,
+            wait=wait_end - post_end,
+        )
 
     def run_batch_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
@@ -719,7 +890,7 @@ class MoriIoBenchmark:
             self.backend_type == "rdma"
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ) and self.role is EngineRole.TARGET:
-            return 0
+            return IterTiming()
 
         # Strided offsets prevent merging: each transfer becomes a separate WR (to stress SQ / reproduce notify ENOMEM)
         offsets = self._get_transfer_offsets(
@@ -759,12 +930,17 @@ class MoriIoBenchmark:
             st = time.time()
             transfer_status = func(*args)[0]
 
+        post_end = time.time()  # batch call returned (WRs submitted)
         transfer_status.Wait()
-        duration = time.time() - st
+        wait_end = time.time()  # batch completion reaped
         assert (
             transfer_status.Succeeded()
         ), f"Batch transfer failed: {transfer_status.Message()}"
-        return duration
+        return IterTiming(
+            total=wait_end - st,
+            post=post_end - st,
+            wait=wait_end - post_end,
+        )
 
     def run_once(self, buffer_size, transfer_batch_size):
         if self.enable_batch_transfer:
@@ -773,26 +949,102 @@ class MoriIoBenchmark:
             return self.run_single_once(buffer_size, transfer_batch_size)
 
     def _run_and_compute(self, buffer_size, transfer_batch_size, iters):
-        latency = []
+        timings = []
         for _ in range(iters):
-            duration = self.run_once(buffer_size, transfer_batch_size)
-            latency.append(duration)
+            timings.append(self.run_once(buffer_size, transfer_batch_size))
+
+        total_mem_mb = buffer_size * transfer_batch_size / (10**6)
 
         if self.role is EngineRole.TARGET and (
             self.backend_type == "rdma"
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ):
-            return 0, 0, 0, 0, 0
+            return SweepResult(
+                msg_size=buffer_size,
+                batch_size=transfer_batch_size,
+                total_mem_mb=total_mem_mb,
+                iters=iters,
+                min_us=0.0,
+                avg_us=0.0,
+                p50_us=0.0,
+                p90_us=0.0,
+                p99_us=0.0,
+                max_us=0.0,
+                std_us=0.0,
+                avg_post_us=0.0,
+                avg_wait_us=0.0,
+                post_frac=0.0,
+                wait_frac=0.0,
+                max_bw=0.0,
+                avg_bw=0.0,
+                eff_pct=-1.0,
+                min_wait_us=0.0,
+                p50_wait_us=0.0,
+                p90_wait_us=0.0,
+                p99_wait_us=0.0,
+                max_wait_us=0.0,
+                std_wait_us=0.0,
+                max_bw_wait=0.0,
+                avg_bw_wait=0.0,
+            )
 
-        total_mem_mb = buffer_size * transfer_batch_size / (10**6)
-        avg_duration = sum(latency) / len(latency)
-        min_duration = min(latency)
-        avg_duration_us = avg_duration * (10**6)
-        min_duration_us = min_duration * (10**6)
-        avg_bw = total_mem_mb / (10**3) / avg_duration
-        max_bw = total_mem_mb / (10**3) / min_duration
+        totals = [t.total for t in timings]
+        posts = [t.post for t in timings]
+        waits = [t.wait for t in timings]
+        n = len(totals)
 
-        return total_mem_mb, avg_duration_us, min_duration_us, avg_bw, max_bw
+        e2e_stats = _latency_stats_us(totals)
+        wait_stats = _latency_stats_us(waits)
+
+        avg_duration = sum(totals) / n
+        min_duration = min(totals)
+        avg_duration_us = e2e_stats["avg_us"]
+        avg_post_us = (sum(posts) / n) * 1e6
+        avg_wait_us = (sum(waits) / n) * 1e6
+        post_frac = (avg_post_us / avg_duration_us) if avg_duration_us > 0 else 0.0
+        wait_frac = (avg_wait_us / avg_duration_us) if avg_duration_us > 0 else 0.0
+
+        avg_bw = _bw_gbps(total_mem_mb, avg_duration)
+        max_bw = _bw_gbps(total_mem_mb, min_duration)
+        min_wait_s = min(waits) if waits else 0.0
+        avg_wait_s = sum(waits) / n if n else 0.0
+        max_bw_wait = _bw_gbps(total_mem_mb, min_wait_s)
+        avg_bw_wait = _bw_gbps(total_mem_mb, avg_wait_s)
+        eff_pct = (
+            (max_bw * 8.0 / self.line_rate_gbps) * 100.0
+            if self.line_rate_gbps > 0
+            else -1.0
+        )
+
+        return SweepResult(
+            msg_size=buffer_size,
+            batch_size=transfer_batch_size,
+            total_mem_mb=total_mem_mb,
+            iters=iters,
+            min_us=e2e_stats["min_us"],
+            avg_us=e2e_stats["avg_us"],
+            p50_us=e2e_stats["p50_us"],
+            p90_us=e2e_stats["p90_us"],
+            p99_us=e2e_stats["p99_us"],
+            max_us=e2e_stats["max_us"],
+            std_us=e2e_stats["std_us"],
+            avg_post_us=avg_post_us,
+            avg_wait_us=avg_wait_us,
+            post_frac=post_frac,
+            wait_frac=wait_frac,
+            max_bw=max_bw,
+            avg_bw=avg_bw,
+            eff_pct=eff_pct,
+            min_wait_us=wait_stats["min_us"],
+            p50_wait_us=wait_stats["p50_us"],
+            p90_wait_us=wait_stats["p90_us"],
+            p99_wait_us=wait_stats["p99_us"],
+            max_wait_us=wait_stats["max_us"],
+            std_wait_us=wait_stats["std_us"],
+            max_bw_wait=max_bw_wait,
+            avg_bw_wait=avg_bw_wait,
+            raw=timings,
+        )
 
     def _get_table_title(self):
         if self.backend_type == "xgmi":
@@ -803,8 +1055,48 @@ class MoriIoBenchmark:
         else:
             return f"RDMA Benchmark: Initiator Rank {self.role_rank}"
 
+    def _is_reporting_side(self):
+        return (
+            self.backend_type == "xgmi" and not self.xgmi_multiprocess
+        ) or self.role is EngineRole.INITIATOR
+
+    def _measure_point(self, buffer_size, transfer_batch_size, table):
+        """Barrier (if needed), time one sweep point, add its table row, and record
+        the SweepResult for CSV output. Returns the SweepResult."""
+        if self.backend_type == "rdma" or (
+            self.backend_type == "xgmi" and self.xgmi_multiprocess
+        ):
+            dist.barrier()
+        res = self._run_and_compute(buffer_size, transfer_batch_size, self.iters)
+        if self.bw_mode == "wait_only":
+            table_max_bw = res.max_bw_wait
+            table_avg_bw = res.avg_bw_wait
+            table_min_lat = res.min_wait_us
+            table_avg_lat = res.avg_wait_us
+        else:
+            table_max_bw = res.max_bw
+            table_avg_bw = res.avg_bw
+            table_min_lat = res.min_us
+            table_avg_lat = res.avg_us
+        table.add_row(
+            [
+                buffer_size,
+                transfer_batch_size,
+                f"{res.total_mem_mb:.2f}",
+                f"{table_max_bw:.2f}",
+                f"{table_avg_bw:.2f}",
+                f"{table_min_lat:.2f}",
+                f"{table_avg_lat:.2f}",
+            ]
+        )
+        if self._is_reporting_side():
+            self.results.append(res)
+        return res
+
     def _run_benchmark_loop(self):
-        self.run_once(self.buffer_size, self.transfer_batch_size)
+        # Discarded warmup transfers (default 2). Warmups never affect stats.
+        for _ in range(self.warmup):
+            self.run_once(self.buffer_size, self.transfer_batch_size)
 
         table = PrettyTable(
             field_names=[
@@ -823,74 +1115,154 @@ class MoriIoBenchmark:
             cur_size = self.sweep_start_size
             max_size = self.sweep_max_size
             while cur_size <= max_size:
-                if self.backend_type == "rdma" or (
-                    self.backend_type == "xgmi" and self.xgmi_multiprocess
-                ):
-                    dist.barrier()
-                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                    self._run_and_compute(
-                        cur_size, self.transfer_batch_size, self.iters
-                    )
-                )
-                table.add_row(
-                    [
-                        cur_size,
-                        self.transfer_batch_size,
-                        f"{total_mem_mb:.2f}",
-                        f"{max_bw:.2f}",
-                        f"{avg_bw:.2f}",
-                        f"{min_duration:.2f}",
-                        f"{avg_duration:.2f}",
-                    ]
-                )
+                self._measure_point(cur_size, self.transfer_batch_size, table)
                 cur_size *= 2
         elif self.sweep_batch:
             cur_transfer_batch_size = 1
             max_transfer_batch_size = 32768
             while cur_transfer_batch_size <= max_transfer_batch_size:
-                if self.backend_type == "rdma" or (
-                    self.backend_type == "xgmi" and self.xgmi_multiprocess
-                ):
-                    dist.barrier()
-                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                    self._run_and_compute(
-                        self.buffer_size, cur_transfer_batch_size, self.iters
-                    )
-                )
-                table.add_row(
-                    [
-                        self.buffer_size,
-                        cur_transfer_batch_size,
-                        f"{total_mem_mb:.2f}",
-                        f"{max_bw:.2f}",
-                        f"{avg_bw:.2f}",
-                        f"{min_duration:.2f}",
-                        f"{avg_duration:.2f}",
-                    ]
-                )
+                self._measure_point(self.buffer_size, cur_transfer_batch_size, table)
                 cur_transfer_batch_size *= 2
         else:
-            total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                self._run_and_compute(
-                    self.buffer_size, self.transfer_batch_size, self.iters
+            self._measure_point(self.buffer_size, self.transfer_batch_size, table)
+
+        if self._is_reporting_side():
+            print(table)
+            self._maybe_write_csv()
+
+    def _maybe_write_csv(self):
+        if self.csv_path:
+            self._write_summary_csv(self.csv_path)
+        if self.csv_raw_path:
+            self._write_raw_csv(self.csv_raw_path)
+
+    def _csv_config_cols(self):
+        """Config columns echoed into every CSV row (dict of name->value)."""
+        return {
+            "backend": self.backend_type,
+            "op_type": self.op_type,
+            "mem_type": self.mem_type,
+            "enable_batch": int(self.enable_batch_transfer),
+            "batch_contiguous": int(self.batch_contiguous),
+            "enable_sess": int(self.enable_sess),
+            "num_qp_per_transfer": self.num_qp_per_transfer,
+            "num_worker_threads": self.num_worker_threads,
+            "enable_chunking": int(self.enable_chunking),
+            "chunk_bytes": self.chunk_bytes,
+            "max_chunks": self.max_chunks,
+            "poll_cq_mode": (
+                "polling" if self.poll_cq_mode == PollCqMode.POLLING else "event"
+            ),
+        }
+
+    def _write_summary_csv(self, path):
+        cfg = self._csv_config_cols()
+        cfg_keys = list(cfg.keys())
+        stat_keys = [
+            "msg_size_B",
+            "batch_size",
+            "total_MB",
+            "iters",
+            "min_lat_us",
+            "avg_lat_us",
+            "p50_us",
+            "p90_us",
+            "p99_us",
+            "max_us",
+            "std_us",
+            "avg_post_us",
+            "avg_wait_us",
+            "post_frac",
+            "wait_frac",
+            "max_bw_gbps",
+            "avg_bw_gbps",
+            "min_lat_wait_us",
+            "avg_lat_wait_us",
+            "p50_wait_us",
+            "p90_wait_us",
+            "p99_wait_us",
+            "max_wait_us",
+            "std_wait_us",
+            "max_bw_wait_gb_s",
+            "avg_bw_wait_gb_s",
+            "eff_pct",
+        ]
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(cfg_keys + stat_keys)
+            for r in self.results:
+                w.writerow(
+                    [cfg[k] for k in cfg_keys]
+                    + [
+                        r.msg_size,
+                        r.batch_size,
+                        f"{r.total_mem_mb:.6f}",
+                        r.iters,
+                        f"{r.min_us:.3f}",
+                        f"{r.avg_us:.3f}",
+                        f"{r.p50_us:.3f}",
+                        f"{r.p90_us:.3f}",
+                        f"{r.p99_us:.3f}",
+                        f"{r.max_us:.3f}",
+                        f"{r.std_us:.3f}",
+                        f"{r.avg_post_us:.3f}",
+                        f"{r.avg_wait_us:.3f}",
+                        f"{r.post_frac:.4f}",
+                        f"{r.wait_frac:.4f}",
+                        f"{r.max_bw:.3f}",
+                        f"{r.avg_bw:.3f}",
+                        f"{r.min_wait_us:.3f}",
+                        f"{r.avg_wait_us:.3f}",
+                        f"{r.p50_wait_us:.3f}",
+                        f"{r.p90_wait_us:.3f}",
+                        f"{r.p99_wait_us:.3f}",
+                        f"{r.max_wait_us:.3f}",
+                        f"{r.std_wait_us:.3f}",
+                        f"{r.max_bw_wait:.3f}",
+                        f"{r.avg_bw_wait:.3f}",
+                        f"{r.eff_pct:.2f}",
+                    ]
                 )
-            )
-            table.add_row(
+        print(f"[benchmark] wrote summary CSV ({len(self.results)} rows): {path}")
+
+    def _write_raw_csv(self, path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        n_rows = 0
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(
                 [
-                    self.buffer_size,
-                    self.transfer_batch_size,
-                    f"{total_mem_mb:.2f}",
-                    f"{max_bw:.2f}",
-                    f"{avg_bw:.2f}",
-                    f"{min_duration:.2f}",
-                    f"{avg_duration:.2f}",
+                    "msg_size_B",
+                    "batch_size",
+                    "iter_idx",
+                    "duration_us",
+                    "post_us",
+                    "wait_us",
+                    "bw_e2e_gb_s",
+                    "bw_wait_gb_s",
                 ]
             )
-
-        if (
-            self.backend_type == "xgmi" and not self.xgmi_multiprocess
-        ) or self.role is EngineRole.INITIATOR:
-            print(table)
+            for r in self.results:
+                total_bytes = r.msg_size * r.batch_size
+                total_mem_mb = total_bytes / (10**6)
+                for i, t in enumerate(r.raw):
+                    bw_e2e = _bw_gbps(total_mem_mb, t.total)
+                    bw_wait = _bw_gbps(total_mem_mb, t.wait)
+                    w.writerow(
+                        [
+                            r.msg_size,
+                            r.batch_size,
+                            i,
+                            f"{t.total * 1e6:.3f}",
+                            f"{t.post * 1e6:.3f}",
+                            f"{t.wait * 1e6:.3f}",
+                            f"{bw_e2e:.3f}",
+                            f"{bw_wait:.3f}",
+                        ]
+                    )
+                    n_rows += 1
+        print(f"[benchmark] wrote raw per-iteration CSV ({n_rows} rows): {path}")
 
     def run(self):
         if self.backend_type == "xgmi":
@@ -976,6 +1348,11 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         num_streams=args.num_streams,
         num_events=args.num_events,
         xgmi_multiprocess=True,
+        warmup=args.warmup,
+        csv_path=args.csv,
+        csv_raw_path=args.csv_raw,
+        line_rate_gbps=args.line_rate_gbps,
+        bw_mode=args.bw_mode,
     )
     bench.print_config()
     bench.run()
@@ -1019,6 +1396,11 @@ def benchmark_engine(local_rank, node_rank, args):
         chunk_bytes=args.chunk_bytes,
         max_chunks=args.max_chunks,
         mem_type=args.mem_type,
+        warmup=args.warmup,
+        csv_path=args.csv,
+        csv_raw_path=args.csv_raw,
+        line_rate_gbps=args.line_rate_gbps,
+        bw_mode=args.bw_mode,
     )
     bench.print_config()
     bench.run()
@@ -1076,6 +1458,11 @@ def benchmark_xgmi(args):
             num_streams=args.num_streams,
             num_events=args.num_events,
             xgmi_multiprocess=False,
+            warmup=args.warmup,
+            csv_path=args.csv,
+            csv_raw_path=args.csv_raw,
+            line_rate_gbps=args.line_rate_gbps,
+            bw_mode=args.bw_mode,
         )
         bench.print_config()
         bench.run()

@@ -13,6 +13,35 @@
 # The benchmark args after `--` are forwarded to tests/python/io/benchmark.py.
 # The script always runs the RDMA backend in 2-node mode with nproc_per_node=1.
 # Timeout can be overridden via MORI_IO_BENCH_TIMEOUT_SEC.
+#
+# ------------------------------------------------------------------------------
+# OPT-IN rocprofv3 marker-trace capture (default OFF; behavior byte-identical when
+# unset). Set ROCPROF=1 to:
+#   * export MORI_ROCTX=1 and MORI_ROCTX_TRANSFER=1 so the MoRI-IO host RDMA path
+#     emits its roctx ranges (mori.rdma.kv_transfer[.read], mori.rdma.batch_post.*,
+#     mori.io.engine_batch_write). These gates are OFF unless ROCPROF=1.
+#   * wrap torchrun with:
+#       rocprofv3 --marker-trace --kernel-trace \
+#                 --output-format pftrace csv json \
+#                 -d <ROCPROF_OUTDIR> -o %hostname%_%pid% --
+#
+# Why marker-trace (not just kernel-trace): a MoRI RDMA write/read is a HOST-side
+# ibv_post_send + NIC hardware op, NOT a HIP kernel, so --kernel-trace is BLIND to
+# the transfer path (empty for --mem-type cpu). The MORI_ROCTX_TRANSFER async
+# ranges (post -> CQE) are the real wire-duration lens; analyze them with
+# tools/profiler/analyze_io_marker_trace.py.
+#
+# Tunables (only read when ROCPROF=1):
+#   ROCPROF_OUTDIR   output dir for traces (default: ./rocprof_io_out)
+#   ROCPROF_BIN      rocprofv3 binary (default: rocprofv3 on PATH)
+#   ROCPROF_EXTRA    extra args spliced before the `--` (e.g. "--stats")
+#
+# Known ROCm-7.2 rocprofiler-sdk quirks to watch for (report if seen):
+#   * async post/CQ marker pattern can emit non-fatal correlation_id.cpp WARN/ERROR
+#     spam -- benign.
+#   * a SIGINT/SIGTERM re-entrant finalize deadlock can yield 0 output files if the
+#     wrapped process is signaled instead of exiting normally (e.g. `timeout` firing).
+#     The benchmark should exit normally; if the outdir is empty, suspect this.
 
 set -euo pipefail
 
@@ -93,7 +122,38 @@ if [[ -n "$NUMA_NODE" ]]; then
   fi
 fi
 
-exec "${NUMACTL[@]}" timeout "$BENCH_TIMEOUT_SEC" torchrun \
+# Optional rocprofv3 marker-trace wrapper (opt-in via ROCPROF=1). When OFF this
+# array is empty and the exec line is identical to the original.
+ROCPROF_PREFIX=()
+if [[ "${ROCPROF:-0}" == "1" || "${ROCPROF:-}" =~ ^[tTyY] ]]; then
+  # Turn ON the MoRI-IO roctx gates ONLY for this profiled run.
+  export MORI_ROCTX=1
+  export MORI_ROCTX_TRANSFER=1
+  ROCPROF_BIN="${ROCPROF_BIN:-rocprofv3}"
+  ROCPROF_OUTDIR="${ROCPROF_OUTDIR:-$REPO_ROOT/rocprof_io_out}"
+  mkdir -p "$ROCPROF_OUTDIR"
+  read -r -a _rocprof_extra <<< "${ROCPROF_EXTRA:-}"
+  ROCPROF_PREFIX=(
+    "$ROCPROF_BIN"
+    --marker-trace
+    --kernel-trace
+    --output-format pftrace csv json
+    -d "$ROCPROF_OUTDIR"
+    -o "%hostname%_%pid%"
+    "${_rocprof_extra[@]}"
+    --
+  )
+  echo "[run_internode_io_benchmark] ROCPROF=1: rank $RANK capturing marker+kernel trace"
+  echo "[run_internode_io_benchmark]   MORI_ROCTX=1 MORI_ROCTX_TRANSFER=1"
+  echo "[run_internode_io_benchmark]   outdir: $ROCPROF_OUTDIR  bin: $ROCPROF_BIN"
+  echo "[run_internode_io_benchmark]   files:  %hostname%_%pid%.{pftrace,csv,json}"
+  if ! command -v "$ROCPROF_BIN" >/dev/null 2>&1; then
+    echo "[run_internode_io_benchmark] WARNING: '$ROCPROF_BIN' not found on PATH;" \
+         "the run will likely fail. Install/point ROCPROF_BIN at rocprofv3." >&2
+  fi
+fi
+
+exec "${NUMACTL[@]}" timeout "$BENCH_TIMEOUT_SEC" "${ROCPROF_PREFIX[@]}" torchrun \
   --nnodes=2 \
   --node_rank="$RANK" \
   --nproc_per_node=1 \

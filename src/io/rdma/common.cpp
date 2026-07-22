@@ -607,7 +607,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                                        static_cast<uint64_t>(id), isRead,
                                        static_cast<uint64_t>(epBytesSinceSignal[epId]),
                                        static_cast<uint64_t>(epWrsSinceSignal[epId]),
-                                       static_cast<uint64_t>(epMergedSinceSignal[epId]));
+                                       static_cast<uint64_t>(epMergedSinceSignal[epId]),
+                                       static_cast<uint64_t>(epId));
     }
 
     struct ibv_send_wr* badWr = nullptr;

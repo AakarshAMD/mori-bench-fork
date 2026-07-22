@@ -194,17 +194,21 @@ inline void MoriRoctxMark(const std::string& msg) {
 // the pre-merge logical request count coalesced into this signaled segment's
 // WRs (same accumulation window as wrs=). Placed BEFORE id= (same rule as
 // bytes=/wrs=): "<name> bytes=<N> wrs=<M> merged=<K> id=<id>".
+// ADDITIVE: `qp` carries the per-endpoint index (epIdx) of the QP that posted
+// this signaled WR. Placed BEFORE id= (same rule as bytes=/wrs=/merged=):
+// "<name> bytes=<N> wrs=<M> merged=<K> qp=<Q> id=<id>".
 inline void MoriRoctxTransferStart(const void* ledger, std::uint64_t recordId,
                                    std::uint64_t transferId, bool isRead,
                                    std::uint64_t bytes = 0, std::uint64_t wrs = 0,
-                                   std::uint64_t merged = 0) {
+                                   std::uint64_t merged = 0, std::uint64_t qp = 0) {
   auto& a = roctx_detail::api();
   if (!a.transfer_enabled || a.range_start == nullptr || ledger == nullptr) return;
-  // bytes=/wrs=/merged= placed BEFORE id= so the end-anchored id= parsers keep matching.
+  // bytes=/wrs=/merged=/qp= placed BEFORE id= so the end-anchored id= parsers keep matching.
   std::string s =
       std::string(isRead ? "mori.rdma.kv_transfer.read" : "mori.rdma.kv_transfer") +
       " bytes=" + std::to_string(bytes) + " wrs=" + std::to_string(wrs) +
-      " merged=" + std::to_string(merged) + " id=" + std::to_string(transferId);
+      " merged=" + std::to_string(merged) + " qp=" + std::to_string(qp) +
+      " id=" + std::to_string(transferId);
   roctx_detail::roctx_range_id_t rid = a.range_start(s.c_str());
   auto& t = roctx_detail::transfer_ranges();
   std::lock_guard<std::mutex> lk(t.mu);
