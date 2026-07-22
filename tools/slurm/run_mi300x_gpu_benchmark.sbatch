@@ -7,7 +7,7 @@
 #SBATCH --exclusive
 #SBATCH --exclude=useocpm2m-097-119
 #SBATCH --time=04:00:00
-#SBATCH --output=mori-bench-fork-gpu-%j.out
+#SBATCH --output=/shared_inference/aarai/distinf/mori_bench_fork_runs/slurm-%j.out
 
 set -euo pipefail
 
