@@ -17,6 +17,11 @@ def data_rows(path):
         return max(0, sum(1 for _ in csv.reader(stream)) - 1)
 
 
+def metrics(path):
+    with open(path, newline="", encoding="utf-8", errors="replace") as stream:
+        return {row["metric"]: row["value"] for row in csv.DictReader(stream)}
+
+
 def main():
     root = os.path.abspath(sys.argv[1])
 
@@ -46,12 +51,28 @@ def main():
         require(jsons, f"no JSON trace in {trace_dir}")
         require(pftraces, f"no pftrace in {trace_dir}")
         qp_rows = 0
+        qp_posts = 0
+        qp_cqes = 0
         for path in markers:
             with open(path, encoding="utf-8", errors="replace") as stream:
-                qp_rows += sum("mori.rdma.kv_transfer" in line and "qp=" in line for line in stream)
+                for line in stream:
+                    qp_rows += "mori.rdma.kv_transfer" in line and "qp=" in line
+                    qp_posts += "mori.rdma.qp_post " in line
+                    qp_cqes += "mori.rdma.qp_cqe " in line
         require(qp_rows > 0, f"no kv_transfer qp= marker rows in {trace_dir}")
+        require(qp_posts > 0, f"no qp_post marker rows in {trace_dir}")
+        require(qp_posts == qp_cqes, f"keyed endpoint mismatch post={qp_posts} cqe={qp_cqes}")
+
+        analysis = metrics(os.path.join(root, "out", f"{phase}_marker_analysis.csv"))
+        joined = int(analysis["keyed_joined_stripe_count"])
+        require(int(analysis["keyed_diagnostic_count"]) == 0, f"{phase} keyed diagnostics present")
+        require(joined == int(analysis["keyed_endpoint_post_count"]), f"{phase} missing joins")
+        require(joined == int(analysis["keyed_endpoint_cqe_count"]), f"{phase} duplicate joins")
+        require(int(analysis["measured_phase_filter_used"]) == 1, f"{phase} phase filter missing")
+        require(data_rows(os.path.join(root, "out", f"{phase}_qp_stripes.csv")) == joined, f"{phase} stripe CSV mismatch")
         print(
             f"TRACE {phase} marker_csv={len(markers)} qp_rows={qp_rows} "
+            f"qp_post={qp_posts} qp_cqe={qp_cqes} joined={joined} "
             f"json={len(jsons)} pftrace={len(pftraces)}"
         )
 

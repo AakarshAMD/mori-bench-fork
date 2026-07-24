@@ -34,6 +34,7 @@ from mori.io import (
     set_log_level,
 )
 import argparse
+import ctypes
 from dataclasses import dataclass, field
 from enum import Enum
 import csv as _csv
@@ -41,6 +42,26 @@ import math
 import os
 import time
 from prettytable import PrettyTable
+
+
+_ROCTX_MARK = None
+
+
+def _mark_benchmark_phase(name):
+    """Emit an instant phase boundary without adding per-iteration overhead."""
+    global _ROCTX_MARK
+    if not os.getenv("MORI_ROCTX_TRANSFER"):
+        return
+    if _ROCTX_MARK is None:
+        try:
+            lib = ctypes.CDLL("librocprofiler-sdk-roctx.so", mode=ctypes.RTLD_GLOBAL)
+            _ROCTX_MARK = lib.roctxMarkA
+            _ROCTX_MARK.argtypes = [ctypes.c_char_p]
+            _ROCTX_MARK.restype = None
+        except (OSError, AttributeError):
+            _ROCTX_MARK = False
+    if _ROCTX_MARK:
+        _ROCTX_MARK(f"mori.bench.phase {name}".encode())
 
 
 @dataclass
@@ -1098,6 +1119,7 @@ class MoriIoBenchmark:
         for _ in range(self.warmup):
             self.run_once(self.buffer_size, self.transfer_batch_size)
 
+        _mark_benchmark_phase("measured_begin")
         table = PrettyTable(
             field_names=[
                 "MsgSize (B)",
@@ -1125,6 +1147,7 @@ class MoriIoBenchmark:
                 cur_transfer_batch_size *= 2
         else:
             self._measure_point(self.buffer_size, self.transfer_batch_size, table)
+        _mark_benchmark_phase("measured_end")
 
         if self._is_reporting_side():
             print(table)

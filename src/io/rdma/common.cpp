@@ -646,8 +646,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         int dummy = 0;
         eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
         // ADDITIVE (MORI_ROCTX_TRANSFER=1): the signaled WR never posted, so no CQE
-        // will arrive — stop its async range here to avoid a leaked range.
-        mori::io::MoriRoctxTransferStop(eps[epId].ledger.get(), recordId);
+        // will arrive — stop its async range here to avoid a leaked range, but do
+        // not emit a qp_cqe endpoint for work that never reached the NIC.
+        mori::io::MoriRoctxTransferStop(eps[epId].ledger.get(), recordId, false);
       }
 
       if (postedCount > 0 && (!needSignal || !lastWasPosted)) {

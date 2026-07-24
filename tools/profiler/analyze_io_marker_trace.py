@@ -71,6 +71,9 @@ from collections import defaultdict
 # Range-name substrings we care about.
 KV_WRITE = "mori.rdma.kv_transfer"
 KV_READ = "mori.rdma.kv_transfer.read"
+QP_POST = "mori.rdma.qp_post"
+QP_CQE = "mori.rdma.qp_cqe"
+PHASE = "mori.bench.phase"
 POST_PREFIXES = ("mori.rdma.batch_post", "mori.io.engine_batch_write")
 
 # bytes=/wrs=/merged=/qp=/id= are appended by roctx_mori.hpp (id= is always LAST).
@@ -80,23 +83,33 @@ _TAG_RE = {
     "merged": re.compile(r"merged=(\d+)"),
     "qp": re.compile(r"qp=(\d+)"),
     "id": re.compile(r"id=(\d+)"),
+    "key": re.compile(r"key=(\d+)"),
 }
+_OP_RE = re.compile(r"op=(read|write)")
 
 
 class Range:
-    __slots__ = ("name", "base", "start", "end", "tid", "bytes", "wrs", "merged", "qp", "xid")
+    __slots__ = (
+        "name", "base", "start", "end", "tid", "pid", "source",
+        "bytes", "wrs", "merged", "qp", "xid", "key", "op",
+    )
 
-    def __init__(self, name, start, end, tid):
+    def __init__(self, name, start, end, tid, pid="?", source=""):
         self.name = name
         self.start = start  # microseconds (normalized)
         self.end = end
         self.tid = tid
+        self.pid = str(pid)
+        self.source = source
         self.base = _base_name(name)
         self.bytes = _tag(name, "bytes")
         self.wrs = _tag(name, "wrs")
         self.merged = _tag(name, "merged")
         self.qp = _tag(name, "qp")
         self.xid = _tag(name, "id")
+        self.key = _tag(name, "key")
+        op = _OP_RE.search(name)
+        self.op = op.group(1) if op else ("read" if self.base == KV_READ else "write")
 
     @property
     def dur(self):
@@ -232,6 +245,7 @@ _NAME_COLS = ["function", "name", "operation", "message", "kind", "label"]
 _START_COLS = ["start_timestamp", "start", "start_ns", "begin", "begin_timestamp"]
 _END_COLS = ["end_timestamp", "end", "end_ns", "finish"]
 _TID_COLS = ["thread_id", "tid"]
+_PID_COLS = ["process_id", "pid"]
 
 
 def _find_col(header_lower, candidates):
@@ -259,6 +273,7 @@ def parse_marker_csv(path, unit):
         si = _find_col(hl, _START_COLS)
         ei = _find_col(hl, _END_COLS)
         ti = _find_col(hl, _TID_COLS)
+        pi = _find_col(hl, _PID_COLS)
         if ni is None or si is None or ei is None:
             # Some rocprofv3 builds put the roctx message in the LAST column.
             if ni is None:
@@ -280,7 +295,8 @@ def parse_marker_csv(path, unit):
             except ValueError:
                 continue
             tid = row[ti].strip() if ti is not None and ti < len(row) else "?"
-            ranges.append(Range(name, start, end, tid))
+            pid = row[pi].strip() if pi is not None and pi < len(row) else "?"
+            ranges.append(Range(name, start, end, tid, pid, os.path.abspath(path)))
     return ranges
 
 
@@ -302,7 +318,10 @@ def parse_marker_json(path, unit):
             elif ph == "X" and _is_interesting(e.get("name", "")):
                 s = float(e["ts"]) * scale
                 ranges.append(
-                    Range(e["name"], s, s + float(e.get("dur", 0)) * scale, e.get("tid", "?"))
+                    Range(
+                        e["name"], s, s + float(e.get("dur", 0)) * scale,
+                        e.get("tid", "?"), e.get("pid", "?"), os.path.abspath(path)
+                    )
                 )
         for tid, phases in by_tid.items():
             begins = sorted(phases["B"], key=lambda x: x["ts"])
@@ -310,7 +329,10 @@ def parse_marker_json(path, unit):
             for b, e in zip(begins, ends):
                 if _is_interesting(b.get("name", "")):
                     ranges.append(
-                        Range(b["name"], float(b["ts"]) * scale, float(e["ts"]) * scale, tid)
+                        Range(
+                            b["name"], float(b["ts"]) * scale, float(e["ts"]) * scale,
+                            tid, b.get("pid", "?"), os.path.abspath(path)
+                        )
                     )
         return ranges
 
@@ -324,7 +346,11 @@ def parse_marker_json(path, unit):
             if isinstance(nm, str) and st is not None and en is not None and _is_interesting(nm):
                 try:
                     ranges.append(
-                        Range(nm, float(st) * scale, float(en) * scale, obj.get("thread_id", "?"))
+                        Range(
+                            nm, float(st) * scale, float(en) * scale,
+                            obj.get("thread_id", "?"), obj.get("process_id", "?"),
+                            os.path.abspath(path)
+                        )
                     )
                 except (TypeError, ValueError):
                     pass
@@ -339,7 +365,13 @@ def parse_marker_json(path, unit):
 
 
 def _is_interesting(name):
-    return name.startswith(KV_WRITE) or name.startswith(POST_PREFIXES)
+    return (
+        name.startswith(KV_WRITE)
+        or name.startswith(QP_POST)
+        or name.startswith(QP_CQE)
+        or name.startswith(PHASE)
+        or name.startswith(POST_PREFIXES)
+    )
 
 
 def _discover_inputs(path):
@@ -361,6 +393,160 @@ def _discover_inputs(path):
 
 
 # ---------------------------------------------------------------------------
+# Keyed instant-event reconstruction
+# ---------------------------------------------------------------------------
+
+
+class QpStripe:
+    __slots__ = (
+        "source", "pid", "key", "xid", "qp", "op", "bytes", "wrs", "merged",
+        "post", "cqe",
+    )
+
+    def __init__(self, post, cqe):
+        self.source = post.source
+        self.pid = post.pid
+        self.key = post.key
+        self.xid = post.xid
+        self.qp = post.qp
+        self.op = post.op
+        self.bytes = post.bytes
+        self.wrs = post.wrs
+        self.merged = post.merged
+        self.post = post.start
+        self.cqe = cqe.start
+
+    @property
+    def dur(self):
+        return self.cqe - self.post
+
+    @property
+    def bw(self):
+        return (self.bytes / 1e9) / (self.dur / 1e6) if self.bytes and self.dur > 0 else 0.0
+
+
+def _phase_windows(records):
+    """Return per-process measured windows and phase-boundary diagnostics."""
+    bounds = defaultdict(lambda: {"begin": [], "end": []})
+    for r in records:
+        if r.base != PHASE:
+            continue
+        if "measured_begin" in r.name:
+            bounds[(r.source, r.pid)]["begin"].append(r.start)
+        elif "measured_end" in r.name:
+            bounds[(r.source, r.pid)]["end"].append(r.start)
+    windows = defaultdict(list)
+    issues = []
+    for proc, sides in bounds.items():
+        begins = sorted(sides["begin"])
+        ends = sorted(sides["end"])
+        if len(begins) != len(ends):
+            issues.append(
+                f"phase boundary mismatch source={os.path.basename(proc[0])} pid={proc[1]} "
+                f"begin={len(begins)} end={len(ends)}"
+            )
+        for begin, end in zip(begins, ends):
+            if end >= begin:
+                windows[proc].append((begin, end))
+            else:
+                issues.append(
+                    f"phase end precedes begin source={os.path.basename(proc[0])} pid={proc[1]}"
+                )
+    return windows, issues
+
+
+def _in_measured_phase(record, windows):
+    proc_windows = windows.get((record.source, record.pid))
+    if not proc_windows:
+        return True
+    return any(begin <= record.start <= end for begin, end in proc_windows)
+
+
+def join_qp_events(records, measured_only=True):
+    """Join qp_post -> qp_cqe using (trace source, process, key, qp).
+
+    Returns (stripes, diagnostics, used_phase_filter). Duplicate and missing
+    endpoints are diagnostics and are never paired by order.
+    """
+    windows, diagnostics = _phase_windows(records)
+    events = [
+        r
+        for r in records
+        if r.base in (QP_POST, QP_CQE)
+        and (not measured_only or _in_measured_phase(r, windows))
+    ]
+    grouped = defaultdict(lambda: {"post": [], "cqe": []})
+    for event in events:
+        if event.key is None or event.qp is None:
+            diagnostics.append(f"unkeyed {event.base}: {event.name}")
+            continue
+        side = "post" if event.base == QP_POST else "cqe"
+        grouped[(event.source, event.pid, event.key, event.qp)][side].append(event)
+
+    stripes = []
+    for join_key, sides in sorted(grouped.items(), key=lambda item: str(item[0])):
+        posts, cqes = sides["post"], sides["cqe"]
+        short = (
+            f"source={os.path.basename(join_key[0])} pid={join_key[1]} "
+            f"key={join_key[2]} qp={join_key[3]}"
+        )
+        if len(posts) != 1 or len(cqes) != 1:
+            diagnostics.append(f"endpoint cardinality {short} post={len(posts)} cqe={len(cqes)}")
+            continue
+        post, cqe = posts[0], cqes[0]
+        for field in ("xid", "qp", "bytes", "wrs", "merged", "op"):
+            if getattr(post, field) != getattr(cqe, field):
+                diagnostics.append(
+                    f"metadata mismatch {short} field={field} "
+                    f"post={getattr(post, field)} cqe={getattr(cqe, field)}"
+                )
+        stripe = QpStripe(post, cqe)
+        if stripe.dur < 0:
+            diagnostics.append(f"negative duration {short} duration_us={stripe.dur:.3f}")
+            continue
+        stripes.append(stripe)
+    return stripes, diagnostics, bool(windows)
+
+
+def group_logical_transfers(stripes):
+    groups = defaultdict(list)
+    for stripe in stripes:
+        groups[(stripe.source, stripe.pid, stripe.xid, stripe.op)].append(stripe)
+    logical = []
+    for key, group in sorted(groups.items(), key=lambda item: str(item[0])):
+        start = min(s.post for s in group)
+        end = max(s.cqe for s in group)
+        total_bytes = sum(s.bytes or 0 for s in group)
+        qps = sorted({s.qp for s in group})
+        logical.append(
+            {
+                "source": key[0],
+                "pid": key[1],
+                "id": key[2],
+                "op": key[3],
+                "stripes": group,
+                "qps": qps,
+                "bytes": total_bytes,
+                "start": start,
+                "end": end,
+                "duration_us": end - start,
+                "bw_gb_s": (total_bytes / 1e9) / ((end - start) / 1e6) if end > start else 0.0,
+                "start_skew_us": max(s.post for s in group) - start,
+                "completion_skew_us": end - min(s.cqe for s in group),
+            }
+        )
+    return logical
+
+
+def write_detail_csv(path, rows, fields):
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -374,21 +560,29 @@ def _fmt_stat(label, st, unit="us"):
     )
 
 
-def analyze(ranges, out_csv=None, line_rate_gbps=0.0):
+def analyze(
+    ranges,
+    out_csv=None,
+    line_rate_gbps=0.0,
+    stripes_csv=None,
+    logical_csv=None,
+    measured_only=True,
+):
     kv = [r for r in ranges if r.base in (KV_WRITE, KV_READ)]
     kv_write = [r for r in kv if r.base == KV_WRITE]
     kv_read = [r for r in kv if r.base == KV_READ]
     posts = [r for r in ranges if any(r.base.startswith(p) for p in POST_PREFIXES)]
+    endpoint_events = [r for r in ranges if r.base in (QP_POST, QP_CQE)]
 
     print("=" * 78)
     print("MORI-IO MARKER-TRACE ANALYSIS")
     print("=" * 78)
     print(
-        f"parsed ranges: {len(ranges)}  "
+        f"parsed records: {len(ranges)}  keyed endpoints={len(endpoint_events)}  "
         f"(kv_transfer write={len(kv_write)} read={len(kv_read)}; "
         f"host-post={len(posts)})"
     )
-    if not kv and not posts:
+    if not endpoint_events and not kv and not posts:
         print(
             "\n[!] No MoRI-IO roctx ranges found. Check that the run had "
             "MORI_ROCTX_TRANSFER=1 / MORI_ROCTX=1 and that rocprofv3 --marker-trace "
@@ -398,9 +592,141 @@ def analyze(ranges, out_csv=None, line_rate_gbps=0.0):
 
     derived = {}
 
-    # ---- Per-transfer duration stats (wire duration = post->CQE) -------------
+    stripes = []
+    if endpoint_events:
+        stripes, diagnostics, used_phase_filter = join_qp_events(ranges, measured_only)
+        logical = group_logical_transfers(stripes)
+        windows, _ = _phase_windows(ranges)
+        selected_endpoints = [
+            event
+            for event in endpoint_events
+            if not measured_only or _in_measured_phase(event, windows)
+        ]
+        post_count = sum(r.base == QP_POST for r in selected_endpoints)
+        cqe_count = sum(r.base == QP_CQE for r in selected_endpoints)
+        phase_selection = (
+            "explicit measured windows"
+            if used_phase_filter and measured_only
+            else "all records; no measured-phase filtering available"
+        )
+        print("\n[1] KEYED PER-QP STRIPES (qp_post -> qp_cqe instant marks)")
+        print(f"  phase selection: {phase_selection}")
+        print(
+            f"  selected endpoints: post={post_count} cqe={cqe_count} "
+            f"joined per-QP stripes={len(stripes)}"
+        )
+        for stripe in sorted(stripes, key=lambda s: (s.source, s.pid, s.xid, s.qp, s.key)):
+            print(
+                f"  per-QP stripe id={stripe.xid} qp={stripe.qp} key={stripe.key} "
+                f"bytes={stripe.bytes} wrs={stripe.wrs} duration={stripe.dur:.3f} us "
+                f"stripe_bw={stripe.bw:.3f} GB/s"
+            )
+        if diagnostics:
+            print(f"  [!] endpoint diagnostics ({len(diagnostics)}):")
+            for issue in diagnostics:
+                print(f"      {issue}")
+        else:
+            print("  endpoint diagnostics: none (all keys unique and complete)")
+
+        print("\n[2] LOGICAL TRANSFERS (all per-QP stripes grouped by process/id/op)")
+        for item in logical:
+            print(
+                f"  logical id={item['id']} op={item['op']} qps={item['qps']} "
+                f"stripes={len(item['stripes'])} bytes={item['bytes']} "
+                f"duration={item['duration_us']:.3f} us bw={item['bw_gb_s']:.3f} GB/s "
+                f"start_skew={item['start_skew_us']:.3f} us "
+                f"completion_skew={item['completion_skew_us']:.3f} us"
+            )
+        derived["keyed_endpoint_post_count"] = post_count
+        derived["keyed_endpoint_cqe_count"] = cqe_count
+        derived["keyed_endpoint_raw_count"] = len(endpoint_events)
+        derived["keyed_joined_stripe_count"] = len(stripes)
+        derived["keyed_diagnostic_count"] = len(diagnostics)
+        derived["logical_transfer_count"] = len(logical)
+        derived["measured_phase_filter_used"] = int(used_phase_filter and measured_only)
+        if stripes:
+            stripe_durs = _stats([s.dur for s in stripes])
+            derived["per_qp_stripe_dur_avg_us"] = round(stripe_durs["avg"], 3)
+            derived["per_qp_stripe_dur_max_us"] = round(stripe_durs["max"], 3)
+        if logical:
+            logical_durs = _stats([item["duration_us"] for item in logical])
+            logical_bws = _stats([item["bw_gb_s"] for item in logical])
+            derived["logical_dur_avg_us"] = round(logical_durs["avg"], 3)
+            derived["logical_dur_max_us"] = round(logical_durs["max"], 3)
+            derived["logical_bw_avg_gb_s"] = round(logical_bws["avg"], 3)
+            derived["logical_bw_max_gb_s"] = round(logical_bws["max"], 3)
+            derived["start_skew_avg_us"] = round(
+                _stats([item["start_skew_us"] for item in logical])["avg"], 3
+            )
+            derived["completion_skew_avg_us"] = round(
+                _stats([item["completion_skew_us"] for item in logical])["avg"], 3
+            )
+
+        if stripes_csv:
+            write_detail_csv(
+                stripes_csv,
+                [
+                    {
+                        "row_type": "per-QP stripe",
+                        "source": os.path.basename(s.source),
+                        "pid": s.pid,
+                        "id": s.xid,
+                        "qp": s.qp,
+                        "key": s.key,
+                        "op": s.op,
+                        "bytes": s.bytes,
+                        "wrs": s.wrs,
+                        "merged": s.merged,
+                        "post_us": f"{s.post:.3f}",
+                        "cqe_us": f"{s.cqe:.3f}",
+                        "duration_us": f"{s.dur:.3f}",
+                        "stripe_bw_gb_s": f"{s.bw:.6f}",
+                    }
+                    for s in stripes
+                ],
+                [
+                    "row_type", "source", "pid", "id", "qp", "key", "op", "bytes",
+                    "wrs", "merged", "post_us", "cqe_us", "duration_us", "stripe_bw_gb_s",
+                ],
+            )
+            print(f"  [saved] per-QP stripe CSV -> {stripes_csv}")
+        if logical_csv:
+            write_detail_csv(
+                logical_csv,
+                [
+                    {
+                        "row_type": "logical transfer",
+                        "source": os.path.basename(item["source"]),
+                        "pid": item["pid"],
+                        "id": item["id"],
+                        "op": item["op"],
+                        "qps": ";".join(str(qp) for qp in item["qps"]),
+                        "stripe_count": len(item["stripes"]),
+                        "bytes": item["bytes"],
+                        "duration_us": f"{item['duration_us']:.3f}",
+                        "logical_bw_gb_s": f"{item['bw_gb_s']:.6f}",
+                        "start_skew_us": f"{item['start_skew_us']:.3f}",
+                        "completion_skew_us": f"{item['completion_skew_us']:.3f}",
+                    }
+                    for item in logical
+                ],
+                [
+                    "row_type", "source", "pid", "id", "op", "qps", "stripe_count",
+                    "bytes", "duration_us", "logical_bw_gb_s", "start_skew_us",
+                    "completion_skew_us",
+                ],
+            )
+            print(f"  [saved] logical transfer CSV -> {logical_csv}")
+    elif kv:
+        print(
+            "\n[!] DEGRADED RANGE-ONLY INFERENCE: no qp_post/qp_cqe instant marks. "
+            "Legacy async ranges may be corrupted by cross-thread ROCTx correlation "
+            "and are not authoritative per-QP timings."
+        )
+
+    # ---- Retained range visualization / backward compatibility --------------
     if kv:
-        print("\n[1] PER-TRANSFER WIRE DURATION (async post->CQE ranges)")
+        print("\n[legacy] ASYNC RANGE VISUALIZATION (not keyed timing authority)")
         qp_values = sorted({r.qp for r in kv if r.qp is not None})
         if qp_values:
             print(f"  observed QP indices: {qp_values}")
@@ -520,7 +846,11 @@ def analyze(ranges, out_csv=None, line_rate_gbps=0.0):
 
     # ---- Derived-metrics CSV -------------------------------------------------
     if out_csv:
-        if line_rate_gbps > 0 and "per_transfer_bw_max_gbps" in derived:
+        if line_rate_gbps > 0 and "logical_bw_max_gb_s" in derived:
+            derived["logical_eff_vs_line_pct"] = round(
+                100.0 * (derived["logical_bw_max_gb_s"] * 8.0) / line_rate_gbps, 2
+            )
+        elif line_rate_gbps > 0 and "per_transfer_bw_max_gbps" in derived:
             # per_transfer_bw is GB/s (bytes); *8 -> Gb/s (bits) vs line rate.
             derived["eff_vs_line_pct"] = round(
                 100.0 * (derived["per_transfer_bw_max_gbps"] * 8.0) / line_rate_gbps, 2
@@ -562,6 +892,21 @@ def main():
         default=0.0,
         help="Optional line rate (Gb/s) for an efficiency %% in the derived CSV.",
     )
+    p.add_argument(
+        "--out-stripes-csv",
+        default="",
+        help="Write one correctly joined 'per-QP stripe' row per submission key.",
+    )
+    p.add_argument(
+        "--out-logical-csv",
+        default="",
+        help="Write logical-transfer rows grouped across all QP stripes.",
+    )
+    p.add_argument(
+        "--include-unmeasured",
+        action="store_true",
+        help="Include setup/warmup events even when explicit measured-phase marks exist.",
+    )
     args = p.parse_args()
 
     inputs = _discover_inputs(args.trace)
@@ -580,7 +925,14 @@ def main():
         except Exception as e:  # noqa: BLE001 - surface parse issues, keep going
             print(f"  [!] failed to parse {path}: {e}", file=sys.stderr)
 
-    analyze(all_ranges, out_csv=args.out_csv or None, line_rate_gbps=args.line_rate_gbps)
+    analyze(
+        all_ranges,
+        out_csv=args.out_csv or None,
+        line_rate_gbps=args.line_rate_gbps,
+        stripes_csv=args.out_stripes_csv or None,
+        logical_csv=args.out_logical_csv or None,
+        measured_only=not args.include_unmeasured,
+    )
 
 
 if __name__ == "__main__":

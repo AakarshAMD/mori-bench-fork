@@ -30,6 +30,11 @@
 //       at the post site (eps[i].ledger) and the CQ site (ep.ledger) because both
 //       hold the same shared SubmissionLedger instance.
 //
+//       In addition, collision-safe keyed instant marks are emitted immediately
+//       before ibv_post_send and when the signaled tail CQE is reaped:
+//       mori.rdma.qp_post / mori.rdma.qp_cqe. A process-wide monotonic key joins
+//       the endpoints without relying on cross-thread range correlation.
+//
 // CRITICAL: rocprofv3 (rocprofiler-sdk) --marker-trace only intercepts the
 // rocprofiler-sdk ROCTx library librocprofiler-sdk-roctx.so, NOT legacy
 // libroctx64.so. We dlopen the sdk lib at runtime (RTLD_GLOBAL) and resolve the
@@ -42,6 +47,7 @@
 
 #include <dlfcn.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
@@ -71,6 +77,7 @@ inline bool GateOn(const char* name) {
 struct RoctxApi {
   bool enabled = false;           // MORI_ROCTX: push/pop host-post anchors
   bool transfer_enabled = false;  // MORI_ROCTX_TRANSFER: async post->cq ranges
+  bool transfer_marks_enabled = false;
   roctx_range_push_t push = nullptr;
   roctx_range_pop_t pop = nullptr;
   roctx_mark_t mark = nullptr;
@@ -92,6 +99,7 @@ struct RoctxApi {
     range_stop = reinterpret_cast<roctx_range_stop_t>(dlsym(h, "roctxRangeStop"));
     enabled = want_post && (push != nullptr && pop != nullptr);
     transfer_enabled = want_transfer && (range_start != nullptr && range_stop != nullptr);
+    transfer_marks_enabled = want_transfer && (mark != nullptr);
   }
 };
 
@@ -110,13 +118,35 @@ struct TransferKeyHash {
     return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
   }
 };
+struct TransferRecord {
+  roctx_range_id_t range_id{0};
+  std::uint64_t submission_key{0};
+  std::uint64_t transfer_id{0};
+  std::uint64_t bytes{0};
+  std::uint64_t wrs{0};
+  std::uint64_t merged{0};
+  std::uint64_t qp{0};
+  bool is_read{false};
+};
 struct TransferRanges {
   std::mutex mu;
-  std::unordered_map<TransferKey, roctx_range_id_t, TransferKeyHash> ranges;
+  std::unordered_map<TransferKey, TransferRecord, TransferKeyHash> ranges;
 };
 inline TransferRanges& transfer_ranges() {
   static TransferRanges t;
   return t;
+}
+
+inline std::uint64_t NextSubmissionKey() {
+  static std::atomic<std::uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline std::string QpEventName(const char* event, const TransferRecord& rec) {
+  return std::string(event) + " key=" + std::to_string(rec.submission_key) +
+         " id=" + std::to_string(rec.transfer_id) + " qp=" + std::to_string(rec.qp) +
+         " bytes=" + std::to_string(rec.bytes) + " wrs=" + std::to_string(rec.wrs) +
+         " merged=" + std::to_string(rec.merged) + (rec.is_read ? " op=read" : " op=write");
 }
 
 }  // namespace roctx_detail
@@ -202,44 +232,64 @@ inline void MoriRoctxTransferStart(const void* ledger, std::uint64_t recordId,
                                    std::uint64_t bytes = 0, std::uint64_t wrs = 0,
                                    std::uint64_t merged = 0, std::uint64_t qp = 0) {
   auto& a = roctx_detail::api();
-  if (!a.transfer_enabled || a.range_start == nullptr || ledger == nullptr) return;
+  if ((!a.transfer_enabled && !a.transfer_marks_enabled) || ledger == nullptr) return;
   // bytes=/wrs=/merged=/qp= placed BEFORE id= so the end-anchored id= parsers keep matching.
   std::string s =
       std::string(isRead ? "mori.rdma.kv_transfer.read" : "mori.rdma.kv_transfer") +
       " bytes=" + std::to_string(bytes) + " wrs=" + std::to_string(wrs) +
       " merged=" + std::to_string(merged) + " qp=" + std::to_string(qp) +
       " id=" + std::to_string(transferId);
-  roctx_detail::roctx_range_id_t rid = a.range_start(s.c_str());
+  roctx_detail::TransferRecord rec;
+  rec.range_id = a.transfer_enabled ? a.range_start(s.c_str()) : 0;
+  rec.submission_key = roctx_detail::NextSubmissionKey();
+  rec.transfer_id = transferId;
+  rec.bytes = bytes;
+  rec.wrs = wrs;
+  rec.merged = merged;
+  rec.qp = qp;
+  rec.is_read = isRead;
   auto& t = roctx_detail::transfer_ranges();
-  std::lock_guard<std::mutex> lk(t.mu);
-  t.ranges[{reinterpret_cast<std::uintptr_t>(ledger), recordId}] = rid;
+  {
+    std::lock_guard<std::mutex> lk(t.mu);
+    t.ranges[{reinterpret_cast<std::uintptr_t>(ledger), recordId}] = rec;
+  }
+  // This is deliberately the last instrumentation call before ibv_post_send.
+  // Unlike the retained async range, the instant mark has no cross-thread TLS state.
+  if (a.transfer_marks_enabled) {
+    a.mark(roctx_detail::QpEventName("mori.rdma.qp_post", rec).c_str());
+  }
 }
 
 // Stop the async range for a completed/cleaned-up signaled WR. Idempotent: a
 // no-op if no range was started for this (ledger,recordId) (e.g. unsignaled WRs,
 // notification CQEs). The roctxRangeStop call is made OUTSIDE the map lock.
-inline void MoriRoctxTransferStop(const void* ledger, std::uint64_t recordId) {
+inline void MoriRoctxTransferStop(const void* ledger, std::uint64_t recordId,
+                                  bool emitCompletionMark = true) {
   auto& a = roctx_detail::api();
-  if (!a.transfer_enabled || a.range_stop == nullptr || ledger == nullptr) return;
-  roctx_detail::roctx_range_id_t rid = 0;
+  if ((!a.transfer_enabled && !a.transfer_marks_enabled) || ledger == nullptr) return;
+  roctx_detail::TransferRecord rec;
   bool found = false;
   {
     auto& t = roctx_detail::transfer_ranges();
     std::lock_guard<std::mutex> lk(t.mu);
     auto it = t.ranges.find({reinterpret_cast<std::uintptr_t>(ledger), recordId});
     if (it != t.ranges.end()) {
-      rid = it->second;
+      rec = it->second;
       t.ranges.erase(it);
       found = true;
     }
   }
-  if (found) a.range_stop(rid);
+  if (!found) return;
+  if (a.transfer_enabled && a.range_stop != nullptr) a.range_stop(rec.range_id);
+  if (emitCompletionMark && a.transfer_marks_enabled) {
+    a.mark(roctx_detail::QpEventName("mori.rdma.qp_cqe", rec).c_str());
+  }
 }
 
 // Diagnostics: number of started-but-not-stopped transfer ranges (leak counter).
 inline std::size_t MoriRoctxTransferOutstanding() {
   auto& a = roctx_detail::api();
-  if (!a.transfer_enabled) return 0;
+  if (!a.transfer_enabled && !a.transfer_marks_enabled) return 0;
   auto& t = roctx_detail::transfer_ranges();
   std::lock_guard<std::mutex> lk(t.mu);
   return t.ranges.size();

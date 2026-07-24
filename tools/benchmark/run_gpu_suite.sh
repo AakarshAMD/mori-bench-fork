@@ -29,6 +29,7 @@ MASTER="$(srun --overlap -N1 -n1 -w "$N0" hostname -I | awk '{print $1}')"
   echo "fabric=MORI_RDMA_DEVICES=mlx5_0"
   echo "mem_type=gpu VRAM-to-VRAM"
   echo "MORI_ENABLE_DMABUF_REG=1"
+  echo "qp_per_transfer=${MORI_BENCH_QPS:-2}"
 } | tee "${MORI_BENCH_SCRATCH}/run_metadata.txt"
 
 run_pair() {
@@ -56,7 +57,7 @@ COMMON=(
   --num-initiator-dev 1
   --num-target-dev 1
   --num-worker-threads 1
-  --num-qp-per-transfer 2
+  --num-qp-per-transfer "${MORI_BENCH_QPS:-2}"
   --iters 20
   --warmup 2
   --line-rate-gbps 400
@@ -89,10 +90,14 @@ run_pair P2_gpu_profile 29516 1 "${MORI_BENCH_SCRATCH}/rocprof_p2" \
 python3 "${MORI_BENCH_REPO}/tools/profiler/analyze_io_marker_trace.py" \
   "${MORI_BENCH_SCRATCH}/rocprof_p1" --line-rate-gbps 400 \
   --out-csv "${MORI_BENCH_SCRATCH}/out/p1_marker_analysis.csv" \
+  --out-stripes-csv "${MORI_BENCH_SCRATCH}/out/p1_qp_stripes.csv" \
+  --out-logical-csv "${MORI_BENCH_SCRATCH}/out/p1_logical_transfers.csv" \
   >"${MORI_BENCH_SCRATCH}/out/p1_marker_analysis.log"
 python3 "${MORI_BENCH_REPO}/tools/profiler/analyze_io_marker_trace.py" \
   "${MORI_BENCH_SCRATCH}/rocprof_p2" --line-rate-gbps 400 \
   --out-csv "${MORI_BENCH_SCRATCH}/out/p2_marker_analysis.csv" \
+  --out-stripes-csv "${MORI_BENCH_SCRATCH}/out/p2_qp_stripes.csv" \
+  --out-logical-csv "${MORI_BENCH_SCRATCH}/out/p2_logical_transfers.csv" \
   >"${MORI_BENCH_SCRATCH}/out/p2_marker_analysis.log"
 
 python3 "${MORI_BENCH_REPO}/tools/benchmark/validate_gpu_artifacts.py" \
